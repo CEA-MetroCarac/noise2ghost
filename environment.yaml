@@ -1,0 +1,8 @@
+dependencies:
+    - python
+    - numpy>=1.21
+    - scipy
+    - tqdm
+    - matplotlib
+    - scikit-image
+    - pytorch

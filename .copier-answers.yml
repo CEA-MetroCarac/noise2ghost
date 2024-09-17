@@ -1,0 +1,22 @@
+# Changes here will be overwritten by Copier
+_commit: 27c85cb
+_src_path: code/copier-conda/
+author_email: nicola.vigano@cea.fr
+author_fullname: Nicola Vigano
+author_username: Obi-Wan
+conda_channel: n-vigano
+copyright_date: '2024'
+copyright_holder: Nicola Vigano & Mathieu Manni
+copyright_holder_email: nicola.vigano@cea.fr
+copyright_license: MIT License
+main_branch_name: main
+project_description: Self-supervised deep convolutional reconstructions for ghost
+    imaging.
+project_name: Noise2Ghost
+python_package_command_line_name: n2g
+python_package_distribution_name: noise2ghost
+python_package_import_name: noise2ghost
+python_versions: 3.10 3.11 3.12
+repository_name: noise2ghost
+repository_namespace: CEA-MetroCarac
+
