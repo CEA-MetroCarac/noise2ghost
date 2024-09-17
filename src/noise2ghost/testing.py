@@ -122,7 +122,7 @@ def create_datasets(
     dset_fname = DATASETS_DIR / _get_dataset_filename(info)
     dset_fname = dset_fname.expanduser()
 
-    if not dset_fname.exists() or overwrite:
+    if overwrite or not dset_fname.exists():
         print("Creating NEW data")
         mc, buckets = _generate_data(phantom, sampling_ratio)
         print(f"Created {mc.num_buckets} masks (shape: {mc.masks_enc.shape}) and {len(buckets)} corresponding buckets.")
@@ -162,7 +162,7 @@ def create_datasets(
         phantom=phantom, foreground=foreground, background=background, reconstruction_ls=rec_ls, reconstruction_tv=rec_tv
     )
 
-    if save:
+    if save and (overwrite or not dset_fname.exists()):
         dset_fname.parent.mkdir(parents=True, exist_ok=True)
         fid = DataGI(dset_fname)
         fid.save_data(masks=masks, buckets=buckets)
@@ -170,25 +170,31 @@ def create_datasets(
     return info, volumes, dict(masks=masks, buckets=buckets)
 
 
-def save_results(info: dict, recs: dict, save_old: bool = True) -> None:
+def save_results(info: dict, recs: dict, reg_vals: dict | None = None, save_old: bool = True) -> None:
     result_dir = DATASETS_DIR / "results_N2G"
     result_dir.mkdir(parents=True, exist_ok=True)
 
     results_fname = result_dir / _get_dataset_filename(info, extension="npz")
     results_fname.expanduser()
-    results_fname.parent.mkdir(parents=True, exist_ok=True)
+
     if results_fname.exists() and save_old:
         dst = results_fname.with_stem(results_fname.stem + f"_{dt.now().isoformat()}")
         shutil.move(results_fname, dst)
-    np.savez_compressed(results_fname, **recs)
+
+    results = recs.copy()
+    if reg_vals is not None:
+        for key, val in reg_vals.items():
+            results[f"reg_val_{key}"] = val
+    np.savez_compressed(results_fname, **results)
 
 
-def load_results(info: dict, use_external_gidc: bool = False, use_external_sup: bool = False) -> dict:
+def load_results(info: dict, use_external_gidc: bool = False, use_external_sup: bool = False) -> tuple[dict, dict]:
     results_fname = _get_dataset_filename(info, extension="npz")
     results_fpath = DATASETS_DIR / "results_N2G" / results_fname
     results_fpath.expanduser()
 
-    res_recs = dict(**np.load(results_fpath))
+    results = dict(**np.load(results_fpath))
+    res_recs = {key: val for key, val in results.items() if "reg_val_" not in key}
 
     if use_external_gidc:
         results_fpath = DATASETS_DIR / "results_GIDC" / results_fname
@@ -200,4 +206,4 @@ def load_results(info: dict, use_external_gidc: bool = False, use_external_sup: 
         results_fpath.expanduser()
         res_recs["gi_sup"] = np.load(results_fpath)["rec"]
 
-    return res_recs
+    return res_recs, {key: results[f"reg_val_{key}"] for key in res_recs.keys() if f"reg_val_{key}" in results}

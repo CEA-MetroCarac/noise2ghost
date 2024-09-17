@@ -56,6 +56,7 @@ def split_realizations(
     num_perms: int = 1,
     tst_fraction: float = 0.1,
     cv_fraction: float = 0.1,
+    pre_permute: bool = True,
 ) -> Sequence[tuple[NDArray, NDArray]]:
     """Partition the set of realizations in multiple sub-sets.
 
@@ -79,10 +80,11 @@ def split_realizations(
     Sequence[tuple[NDArray, NDArray]]
         The list of partitions
     """
-    print(f"Total number of realizations: {len(buckets)}, split as:")
+    tot_realizations = len(buckets)
+    print(f"Total number of realizations: {tot_realizations}, split as:")
 
     if num_splits is not None:
-        split_size = int((len(buckets) * (1 - cv_fraction - tst_fraction)) // num_splits)
+        split_size = int((tot_realizations * (1 - cv_fraction - tst_fraction)) // num_splits)
         trn_size = split_size * num_splits
         print(
             f"- A set of {num_splits} splits of {split_size} buckets/masks each,"
@@ -91,16 +93,20 @@ def split_realizations(
         # Slices are within the set
         slices_trn = [slice(ii * split_size, (ii + 1) * split_size) for ii in range(num_splits)]
     else:
-        trn_size = int(len(buckets) * (1 - cv_fraction - tst_fraction))
+        trn_size = int(tot_realizations * (1 - cv_fraction - tst_fraction))
         print(f"- Training set size: {trn_size} ({1 - tst_fraction - cv_fraction:%})")
         slices_trn = []
 
-    tst_size = int(len(buckets) * tst_fraction)
-    cv_size = len(buckets) - trn_size - tst_size
+    tst_size = int(tot_realizations * tst_fraction)
+    cv_size = tot_realizations - trn_size - tst_size
     print(f"- Test set size: {tst_size} ({tst_fraction:%})\n" f"- Cross-validation set size: {cv_size} ({cv_fraction:%})")
 
     masks_flat = masks.reshape([-1, *masks.shape[-2:]])
     # Think of randomizing masks and buckets, in order to avoid bias towards last realizations
+    if pre_permute:
+        rnd_perm = np.random.permutation(tot_realizations)
+        masks_flat = masks_flat[rnd_perm]
+        buckets = buckets[rnd_perm]
 
     masks_trn = masks_flat[:trn_size]
     buckets_trn = buckets[:trn_size]
@@ -743,9 +749,9 @@ class N2G(N2N):
                     loss_trn += loss_tv_fn(tmp_trn_i)
                 if lower_limit is not None:
                     loss_trn += nn.ReLU(inplace=False)(-tmp_trn_i.flatten() + lower_limit).mean()
-                if num_chunks > 1:
-                    s = pt.linalg.svdvals(tmp_trn_i.reshape([tmp_trn_i.shape[0], -1]))
-                    loss_trn += 1e-7 * pt.linalg.norm(s[1:], ord=1)
+                # if num_chunks > 1:
+                #     s = pt.linalg.svdvals(tmp_trn_i.reshape([tmp_trn_i.shape[0], -1]))
+                #     loss_trn += 1e-7 * pt.linalg.norm(s[1:], ord=1)
 
                 loss_trn.backward()
                 loss_trn_val += loss_trn.item()

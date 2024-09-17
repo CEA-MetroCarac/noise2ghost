@@ -11,4 +11,11 @@ __author__ = """Nicola Vigano & Mathieu Manni"""
 __email__ = "nicola.vigano@cea.fr"
 __version__ = get_version()
 
-__all__: list[str] = []
+from . import algos
+from . import io
+from . import losses
+from . import models
+from . import reconstructions
+from . import testing
+
+# __all__: list[str] = []
