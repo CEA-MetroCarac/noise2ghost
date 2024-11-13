@@ -14,6 +14,7 @@ from numpy.typing import NDArray
 from .dncnn import DnCNN
 from .msd import MSDnet
 from .unet import UNet
+from .inr import SIREN, PositionalEncoder
 
 
 class NetworkParams(ABC):
@@ -222,66 +223,60 @@ class NetworkParamsDnCNN(NetworkParams):
         )
 
 
-def create_network(
-    network: Union[str, NetworkParams],
-    device: str = "cuda" if pt.cuda.is_available() else "cpu",
-) -> nn.Module:
-    if isinstance(network, str):
-        if network.lower() == "msd":
-            network = NetworkParamsMSD()
-        elif network.lower() == "unet":
-            network = NetworkParamsUNet()
-        elif network.lower() == "dncnn":
-            network = NetworkParamsDnCNN()
-        else:
-            raise ValueError(f"Invalid network name: {network}")
+class NetworkParamsINR(NetworkParams):
+    """Store INR parameters."""
 
-    # Option a) Use MS-D net
-    if isinstance(network, NetworkParamsMSD):
-        # from msd_pytorch import MSDRegressionModel
+    n_embeddings: int
+    n_layers: int
 
-        # model = MSDRegressionModel(
-        #     network.n_channels_in,
-        #     network.n_channels_out,
-        #     depth=network.n_layers,
-        #     width=network.n_nodes,
-        #     dilations=network.dilations,
-        # )
-        # net = model.net
-        net = MSDnet(
-            network.n_channels_in,
-            network.n_channels_out,
-            n_layers=network.n_layers,
-            n_features=network.n_features,
-            dilations=list(network.dilations),
+    def __init__(
+        self,
+        n_channels_in: int = 2,
+        n_channels_out: int = 1,
+        n_layers: int = 3,
+        n_features: int = 256,
+        n_embeddings: int = 256,
+    ) -> None:
+        """Initialize the DnCNN network parameters definition.
+
+        Parameters
+        ----------
+        n_channels_in : int, optional
+            Number of input channels. Default is 1.
+        n_channels_out : int, optional
+            Number of output channels. Default is 1.
+        n_layers : int, optional
+            Number of layers. Default is 8.
+        n_features : int, optional
+            Number of features. Default is 128.
+        n_embeddings : int, optional
+            Number of embeddings. Default is 128.
+        """
+        super().__init__(n_features=n_features, n_channels_in=n_channels_in, n_channels_out=n_channels_out)
+        self.n_layers = n_layers
+        self.n_embeddings = n_embeddings
+
+    def get_model(self, device: str = "cuda" if is_cuda_available() else "cpu") -> Module:
+        """Get a INR model with the selected parameters.
+
+        Parameters
+        ----------
+        device : str, optional
+            The device that the the model should run on, by default "cuda" if cuda is available, otherwise "cpu".
+
+        Returns
+        -------
+        Module
+            The INR model.
+        """
+        return SIREN(
+            n_channels_in=self.n_channels_in,
+            n_embeddings=self.n_embeddings,
+            n_channels_out=self.n_channels_out,
+            n_layers=self.n_layers,
+            n_features=self.n_features,
             device=device,
         )
-    # Option b) Use UNet
-    elif isinstance(network, NetworkParamsUNet):
-        net = UNet(
-            n_channels_in=network.n_channels_in,
-            n_channels_out=network.n_channels_out,
-            n_features=network.n_features,
-            n_levels=network.n_levels,
-            n_channels_skip=network.n_channels_skip,
-            bilinear=network.bilinear,
-            pad_mode=network.pad_mode,
-            device=device,
-        )
-    # Option c) Use DnCNN
-    elif isinstance(network, NetworkParamsDnCNN):
-        net = DnCNN(
-            n_channels_in=network.n_channels_in,
-            n_channels_out=network.n_channels_out,
-            n_layers=network.n_layers,
-            n_features=network.n_features,
-            device=device,
-        )
-    else:
-        raise ValueError(f"Unknown network architecture: {network}")
-
-    print(f"Model {net.__class__.__name__} - num. parameters: {sum(p.numel() for p in net.parameters() if p.requires_grad)}")
-    return net
 
 
 def create_optimizer(
