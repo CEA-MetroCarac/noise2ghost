@@ -153,7 +153,7 @@ class DataGI:
     def load_data(self) -> tuple[NDArray, NDArray]:
         with h5py.File(self.data_path, mode="r") as hf:
             masks = np.array(get_h5_dataset(hf, "/patterns")[()])
-            buckets = np.array(get_h5_dataset(hf, "/measurements")[()])
+            buckets = np.array(get_h5_dataset(hf, "/measurements")[()], ndmin=2)
         return masks, buckets
 
     def load_xrf_raw_data(self) -> Mapping:

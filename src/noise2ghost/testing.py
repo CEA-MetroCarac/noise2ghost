@@ -19,6 +19,7 @@ import skimage.transform as skt
 from numpy.typing import DTypeLike, NDArray
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from skimage.metrics import mean_squared_error as mse
+from tqdm.auto import tqdm
 
 from .reconstructions import get_reconstruction
 from .io import DataGI
@@ -74,25 +75,45 @@ def _generate_data(phantom: NDArray, sampling_ratio: float) -> tuple[cct.struct_
 
 def _get_dataset_filename(info: dict, extension: str = "h5") -> str:
     ph_dens_str = f"{info['photon_density']:.0g}" if info['photon_density'] is not None else "None"
+    multip = f"_multi-{info['multiplicity']}" if 'multiplicity' in info and info['multiplicity'] > 1 else ""
     return (
         f"{info['phantom_type']}_FoV-{'-'.join(str(x) for x in info['shape_fov'])}_sampling-ratio-{info['sampling_ratio']}"
-        f"_photon-density-{ph_dens_str}_readout-noise-std-{info['readout_noise_std']}.{extension}"
+        f"_photon-density-{ph_dens_str}_readout-noise-std-{info['readout_noise_std']}{multip}.{extension}"
     )
 
 
-def compute_noise_level(buckets_clean: NDArray, buckets: NDArray) -> tuple[float, float]:
-    bkt_cln_std = buckets_clean.std()
-    bkt_err_std = np.std(buckets - buckets_clean)
+def compute_noise_level(buckets_clean: NDArray, buckets: NDArray, compute_variances: bool = False) -> tuple[NDArray, NDArray]:
+    bkt_cln_std = buckets_clean.std(axis=-1)
+    bkt_err_std = np.std(buckets - buckets_clean, axis=-1)
     bkt_err_std_perc = bkt_err_std / bkt_cln_std
-    print(f"Bucket std: {bkt_cln_std:.3}, error std: {bkt_err_std:.3} ({bkt_err_std_perc:.3%})")
-    mean_bucket_value = buckets_clean.mean()
-    b_psnr = psnr(buckets_clean, buckets, data_range=(buckets_clean.max() - buckets_clean.min()))
-    b_mse = mse(buckets_clean - mean_bucket_value, buckets - mean_bucket_value)
-    print(f"PSNR: {b_psnr}, MSE: {b_mse}")
-    variances = cct.processing.noise.compute_variance_poisson(buckets)
-    variances /= variances.mean()
-    print(f"{variances.min() = }, {variances.max() = }")
-    return float(b_psnr), float(b_mse)
+    mean_bucket_value = buckets_clean.mean(axis=-1)
+    multiplicity = bkt_err_std.size
+    b_psnr = np.zeros(multiplicity)
+    b_mse = np.zeros(multiplicity)
+    if multiplicity > 1:
+        for ii in range(multiplicity):
+            if buckets_clean.ndim > 1:
+                b_psnr[ii] = psnr(
+                    buckets_clean[ii], buckets[ii], data_range=(buckets_clean[ii].max() - buckets_clean[ii].min())
+                )
+                b_mse[ii] = mse(buckets_clean[ii] - mean_bucket_value[ii], buckets[ii] - mean_bucket_value[ii])
+                print(f"Bucket std: {bkt_cln_std[ii]:.3}, error std: {bkt_err_std[ii]:.3} ({bkt_err_std_perc[ii]:.3%})")
+                print(f"PSNR: {b_psnr[ii]}, MSE: {b_mse[ii]}")
+            else:
+                b_psnr[ii] = psnr(buckets_clean, buckets[ii], data_range=(buckets_clean.max() - buckets_clean.min()))
+                b_mse[ii] = mse(buckets_clean - mean_bucket_value, buckets[ii] - mean_bucket_value)
+                print(f"Bucket std: {bkt_cln_std:.3}, error std: {bkt_err_std[ii]:.3} ({bkt_err_std_perc[ii]:.3%})")
+                print(f"PSNR: {b_psnr[ii]}, MSE: {b_mse[ii]}")
+    else:
+        b_psnr[0] = psnr(buckets_clean, buckets, data_range=(buckets_clean.max() - buckets_clean.min()))
+        b_mse[0] = mse(buckets_clean - mean_bucket_value, buckets - mean_bucket_value)
+        print(f"Bucket std: {bkt_cln_std:.3}, error std: {bkt_err_std:.3} ({bkt_err_std_perc:.3%})")
+        print(f"PSNR: {b_psnr}, MSE: {b_mse}")
+    if compute_variances:
+        variances = cct.processing.noise.compute_variance_poisson(buckets)
+        variances /= variances.mean()
+        print(f"{variances.min() = }, {variances.max() = }")
+    return b_psnr, b_mse
 
 
 def create_datasets(
@@ -101,6 +122,7 @@ def create_datasets(
     phantom_type: str = "chromosomes",
     photon_density: Optional[float] = None,
     readout_noise_std: Optional[float] = None,
+    multiplicity: int = 1,
     reg_val_tv: Optional[float] = None,
     compute_ls: bool = True,
     save: bool = False,
@@ -110,12 +132,13 @@ def create_datasets(
     phantom, foreground, background = _create_phantom(shape_fov, phantom_type=phantom_type)
     if shape_fov is None:
         shape_fov = phantom.shape
-    info = dict(
+    info: dict = dict(
         shape_fov=shape_fov,
         phantom_type=phantom_type,
         sampling_ratio=sampling_ratio,
         photon_density=photon_density,
         readout_noise_std=readout_noise_std,
+        multiplicity=multiplicity,
     )
 
     DATASETS_DIR.mkdir(parents=True, exist_ok=True)
@@ -124,39 +147,59 @@ def create_datasets(
 
     if overwrite or not dset_fname.exists():
         print("Creating NEW data")
-        mc, buckets = _generate_data(phantom, sampling_ratio)
-        print(f"Created {mc.num_buckets} masks (shape: {mc.masks_enc.shape}) and {len(buckets)} corresponding buckets.")
+        mc, buckets_clean = _generate_data(phantom, sampling_ratio)
+        print(f"Created {mc.num_buckets} masks (shape: {mc.masks_enc.shape}) and {len(buckets_clean)} corresponding buckets.")
 
-        buckets_clean = buckets.copy()
+        all_buckets = []
+        for _ in range(multiplicity):
+            buckets = buckets_clean.copy()
 
-        if photon_density is not None:
-            buckets, _, _ = cct.testing.add_noise(buckets, num_photons=photon_density, add_poisson=True)
-            buckets /= photon_density
+            if photon_density is not None:
+                buckets, _, _ = cct.testing.add_noise(buckets, num_photons=photon_density, add_poisson=True)
+                buckets /= photon_density
 
-        if readout_noise_std is not None:
-            buckets += readout_noise_std * np.random.randn(buckets.shape[0])
+            if readout_noise_std is not None:
+                buckets += readout_noise_std * np.random.randn(buckets.shape[0])
+
+            all_buckets.append(buckets)
+
+        buckets = np.stack(all_buckets, axis=0)
 
         masks = mc.masks_enc
     else:
         print(f"Loading existing data from file: {dset_fname}")
         fid = DataGI(dset_fname)
         masks, buckets = fid.load_data()
-        mc = cct.struct_illum.MaskCollection(masks)
+        buckets = np.array(buckets, ndmin=2)
+        if multiplicity != buckets.shape[0]:
+            raise ValueError(f"Inconsistent multiplicity in dataset! Expected {multiplicity}, and found {buckets.shape[0]}")
 
-        prj = cct.struct_illum.ProjectorGhostImaging(mc)
-        buckets_clean = prj(phantom)
+        if masks.ndim > 3:
+            all_buckets_clean = []
+            for m in masks:
+                mc = cct.struct_illum.MaskCollection(m)
+                prj = cct.struct_illum.ProjectorGhostImaging(mc)
+                all_buckets_clean.append(prj(phantom))
+            buckets_clean = np.stack(all_buckets_clean, axis=0)
+        else:
+            mc = cct.struct_illum.MaskCollection(masks)
+            prj = cct.struct_illum.ProjectorGhostImaging(mc)
+            buckets_clean = prj(phantom)
 
     info["psnr"], info["mse"] = compute_noise_level(buckets_clean, buckets)
 
     rec_ls = None
     if compute_ls:
-        print("Computing least-squares reconstruction with all buckets")
-        rec_ls = get_reconstruction(masks=mc, buckets=buckets)
+        rec_ls = [get_reconstruction(masks=mc, buckets=bs) for bs in tqdm(buckets, desc="LS reconstructions")]
+        rec_ls = np.stack(rec_ls, axis=0)
 
     rec_tv = None
     if reg_val_tv is not None:
-        print("Computing TV reconstruction with all buckets")
-        rec_tv = get_reconstruction(masks=mc, buckets=buckets, reg=cct.regularizers.Regularizer_TV2D(reg_val_tv), verbose=True)
+        rec_tv = [
+            get_reconstruction(masks=mc, buckets=bs, reg=cct.regularizers.Regularizer_TV2D(reg_val_tv), verbose=True)
+            for bs in tqdm(buckets, desc="LS-TV reconstructions")
+        ]
+        rec_tv = np.stack(rec_tv, axis=0)
 
     volumes = dict(
         phantom=phantom, foreground=foreground, background=background, reconstruction_ls=rec_ls, reconstruction_tv=rec_tv

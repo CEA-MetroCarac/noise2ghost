@@ -318,9 +318,10 @@ def do_all_figures(
     phantom: NDArray,
     gi_ls: NDArray,
     gi_tv: NDArray,
-    gi_n2g: NDArray,
+    gi_n2g: Optional[NDArray] = None,
     gi_gidc: Optional[NDArray] = None,
     gi_sup: Optional[NDArray] = None,
+    gi_inr: Optional[NDArray] = None,
     di_pb: Optional[NDArray] = None,
     save: bool = True,
 ):
@@ -342,11 +343,15 @@ def do_all_figures(
     if gi_gidc is not None:
         volumes.append(gi_gidc)
         labels.append("GIDC")
+    if gi_inr is not None:
+        volumes.append(gi_inr)
+        labels.append("INR")
     if di_pb is not None:
         volumes.insert(0, di_pb)
         labels.insert(0, "Pencil-beam")
-    volumes.append(gi_n2g)
-    labels.append("N2G")
+    if gi_n2g is not None:
+        volumes.append(gi_n2g)
+        labels.append("N2G")
     volume_pairs = [(vol, phantom) for vol in volumes]
 
     ph_plots = make_figure(phantom, cbar=True)
@@ -369,8 +374,43 @@ def do_all_figures(
     # We repeat the for loop, because there is too much output from the previous one
     compute_metrics(phantom, volumes=volumes, labels=labels)
 
-    frc_plots = cct.processing.post.plot_frcs(volume_pairs=volume_pairs, labels=labels)  # , snrt=0.4142
-    axs_frcs: Axes = frc_plots[1]
+    frcs = [np.array([])] * len(volume_pairs)
+    xps: list[Optional[tuple[float, float]]] = [(0.0, 0.0)] * len(volume_pairs)
+
+    for ii, pair in enumerate(volume_pairs):
+        frcs[ii], t_hb = cct.processing.post.compute_frc(pair[0], pair[1], smooth=5)  # , snrt=0.4142
+        xps[ii] = cct.processing.post.estimate_resolution(frcs[ii], t_hb)
+
+    nyquist = len(frcs[0])
+    xx = np.linspace(0, 1, nyquist)
+
+    fig_frcs, axs_frcs = plt.subplots(1, 1, sharex=True, sharey=True)
+    for ii, (frc, lab) in enumerate(zip(frcs, labels)):
+        pnt = xps[ii]
+        if pnt is not None:
+            bndw = pnt[0] / (nyquist - 1)
+            lab = f"{lab}, bandwidth: {bndw:.3} $f_N$"
+            axs_frcs.stem(bndw, pnt[1], linefmt=f"C{ii}-.", markerfmt=f"C{ii}o")
+        axs_frcs.plot(xx, np.squeeze(frc), label=lab)
+    axs_frcs.plot(xx, np.squeeze(t_hb), label="T 1/2 bit", linestyle="dashed")
+    # for ii, p in enumerate(xps):
+    #     if p is not None:
+    #         res = p[0] / (nyquist - 1)
+    #         axs.stem(res, p[1], label=f"Resolution ({labels[ii]}): {res:.3}", linefmt=f"C{ii}-.", markerfmt=f"C{ii}o")
+    axs_frcs.set_xlim(0, 1)
+    axs_frcs.set_ylim(0, None)
+    axs_frcs.legend(fontsize=12)
+    axs_frcs.grid()
+    axs_frcs.set_ylabel("Magnitude", fontdict=dict(fontsize=16))
+    axs_frcs.set_xlabel("Spatial frequency / Nyquist", fontdict=dict(fontsize=16))
+    for tl in axs_frcs.get_xticklabels():
+        tl.set_fontsize(13)
+    for tl in axs_frcs.get_yticklabels():
+        tl.set_fontsize(13)
+    fig_frcs.tight_layout()
+
+    # frc_plots = cct.processing.post.plot_frcs(volume_pairs=volume_pairs, labels=labels)  # , snrt=0.4142
+    # axs_frcs: Axes = frc_plots[1]
     legend_frcs: Legend = axs_frcs.get_legend()
     if legend_frcs is not None:
         for txt in legend_frcs.get_texts():
@@ -384,7 +424,7 @@ def do_all_figures(
         txt.set_fontsize(20)
     for line in axs_frcs.get_lines():
         line.set_linewidth(2)
-    fig_frcs: Figure = frc_plots[0]
+    # fig_frcs: Figure = frc_plots[0]
     fig_ph_size = fig_ph.get_size_inches()
     # fig_frcs.set_size_inches(fig_ph_size[0] * 1.76, fig_ph_size[1])
     fig_frcs.set_size_inches(fig_ph_size[0] * 2, fig_ph_size[1] / 1.2)
