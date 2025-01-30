@@ -26,10 +26,7 @@ def _get_pre_spawn_env(num_threads: int) -> dict[str, str]:
 
 
 def _get_dask_config(num_threads: int) -> dict:
-    return {
-        "distributed.nanny.pre-spawn-environ": _get_pre_spawn_env(num_threads),
-        "distributed.worker.multiprocessing-method": "fork",
-    }
+    return {"distributed.nanny.pre-spawn-environ": _get_pre_spawn_env(num_threads)}
 
 
 def get_cluster(
@@ -166,15 +163,19 @@ def process_buckets_series(
         for ii in trange(num_bucket_sets, disable=not verbose, desc="Bucket sets"):
             reg_vals[ii], recs[ii] = reconstruction(masks if broadcast_masks else masks[ii], buckets[ii])
     else:
+
+        def _rec(unaligned_w: NDArray, unaligned_y: NDArray) -> tuple[float, NDArray]:
+            return reconstruction(unaligned_w.copy(), unaligned_y.copy())
+
         if verbose:
             print(f"Parallel processing: Using a cluster of {len(client.cluster.workers)} workers")
             print(f"- Client dashboard: {client.dashboard_link}")
         if broadcast_masks:
             masks_dd = client.scatter(masks, broadcast=True)
-            future_to_ind = {client.submit(reconstruction, masks_dd, bucks): ii for ii, bucks in enumerate(buckets)}
+            future_to_ind = {client.submit(_rec, masks_dd, bucks): ii for ii, bucks in enumerate(buckets)}
         else:
             masks_dd = [client.scatter(m) for m in masks]
-            future_to_ind = {client.submit(reconstruction, masks_dd[ii], bucks): ii for ii, bucks in enumerate(buckets)}
+            future_to_ind = {client.submit(_rec, masks_dd[ii], bucks): ii for ii, bucks in enumerate(buckets)}
 
         recs = [np.array([])] * num_bucket_sets
         reg_vals = np.zeros(num_bucket_sets)
