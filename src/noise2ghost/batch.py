@@ -4,13 +4,12 @@ Distributed processing utilities.
 @author: Nicola Vigano
 """
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from multiprocessing import cpu_count
-from typing import Callable, Union
 
 import numpy as np
 from dask import config as dd_config
-from dask_jobqueue import SLURMCluster
+from dask_jobqueue.slurm import SLURMCluster
 from distributed import Client, Future, LocalCluster, SpecCluster, as_completed
 from numpy.typing import NDArray
 from tqdm.auto import tqdm, trange
@@ -118,11 +117,33 @@ def get_cluster(
     return cluster
 
 
+def get_client(cluster: SpecCluster, verbose: bool = True) -> Client:
+    """
+    Create a client connected to the specified cluster.
+
+    Parameters
+    ----------
+    cluster : SpecCluster
+        The cluster specification to connect to.
+    verbose : bool, optional
+        If True, print the client's dashboard link. Default is True.
+
+    Returns
+    -------
+    Client
+        The client connected to the specified cluster.
+    """
+    client = Client(cluster)
+    if verbose:
+        print(f"Client's dashboard: {client.dashboard_link}")
+    return client
+
+
 def process_buckets_series(
     masks: NDArray,
     buckets: NDArray,
     reconstruction: Callable[[NDArray, NDArray], tuple[float, NDArray]],
-    client: Union[Client, None] = None,
+    client: Client | None = None,
     verbose: bool = True,
 ) -> tuple[NDArray, NDArray]:
     """Batch processing routine for buckets series.
