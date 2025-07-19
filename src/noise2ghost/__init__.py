@@ -12,8 +12,6 @@ __email__ = "nicola.vigano@cea.fr"
 __version__ = get_version()
 
 from . import algos
-from . import io
-from . import losses
 from . import models
 from . import reconstructions
 from . import testing

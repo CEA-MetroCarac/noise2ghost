@@ -6,8 +6,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from noise2ghost.testing import create_datasets
-from noise2ghost.reconstructions import get_reg_value
-from noise2ghost.models import NetworkParamsUNet
+from noise2ghost.reconstructions import fit_variational_reg_weight
+from noise2ghost.config import NetworkParamsUNet
 from noise2ghost.algos import N2G
 
 from corrct.regularizers import Regularizer_TV2D
@@ -29,11 +29,11 @@ if __name__ == "__main__":
         readout_noise_std=PHYSICS_SETTINGS["readout_noise_std"],
     )
 
-    reg_val_tv, volumes["reconstruction_tv"] = get_reg_value(
+    reg_val_tv, volumes["reconstruction_tv"] = fit_variational_reg_weight(
         data["masks"], data["buckets"], reg=Regularizer_TV2D, lambda_range=(0.1, 10)
     )
 
-    solver_n2g = N2G(model=NET_PARS, reg_tv_val=REG_VAL_DIP)
+    solver_n2g = N2G(model=NET_PARS, reg_val=REG_VAL_DIP)
     inp_recs_trn, tgt_trn_data, _, tgt_cv_data, tgt_trn_inds = solver_n2g.prepare_data(
         data["masks"],
         data["buckets"],

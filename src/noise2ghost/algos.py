@@ -1,36 +1,21 @@
 """Algorithms."""
 
 import copy as cp
-from collections.abc import Mapping, Sequence
-from typing import Union
-from dataclasses import dataclass
+from collections.abc import Sequence
 
 import corrct as cct
 import matplotlib.pyplot as plt
 import numpy as np
 import torch as pt
 import torch.nn as nn
-from numpy.typing import DTypeLike, NDArray
-from tqdm.auto import tqdm, trange
+from autoden.algorithms.denoiser import DataScaleBias, Denoiser, get_normalization_range
+from autoden.models.config import create_optimizer
+from autoden.models.param_utils import fix_invalid_gradient_values, get_num_parameters
+from numpy.typing import NDArray
+from tqdm.auto import trange
 
-from .models import NetworkParams, get_num_parameters, create_optimizer, SIREN, PositionalEncoder
-from .io import load_model_state, save_model_state
-from .losses import LossRegularizer, LossTV
-
-
-def _get_normalization(vol: NDArray, percentile: Union[float, None] = None) -> tuple[float, float, float]:
-    if percentile is not None:
-        vol_sort = np.sort(vol.flatten())
-        ind_min = int(np.fmax(vol_sort.size * percentile, 0))
-        ind_max = int(np.fmin(vol_sort.size * (1 - percentile), vol_sort.size - 1))
-        return vol_sort[ind_min], vol_sort[ind_max], vol_sort[ind_min : ind_max + 1].mean()
-    else:
-        return vol.min(), vol.max(), vol.mean()
-
-
-def _single_channel_imgs_to_tensor(imgs: NDArray, device: str, dtype: DTypeLike = np.float32) -> pt.Tensor:
-    imgs = np.array(imgs, ndmin=3).astype(dtype)[..., None, :, :]
-    return pt.tensor(imgs, device=device)
+from noise2ghost.models.config import NetworkParamsINR
+from noise2ghost.models.inr import SIREN, PositionalEncoder
 
 
 def _compute_num_chunks(epochs: int, num_inps: int, size_cap: int = 8) -> NDArray:
@@ -52,7 +37,7 @@ class DatasetSplit:
 def split_realizations(
     masks: NDArray,
     buckets: NDArray,
-    num_splits: Union[int, None] = None,
+    num_splits: int | None = None,
     num_perms: int = 1,
     tst_fraction: float = 0.1,
     cv_fraction: float = 0.1,
@@ -144,504 +129,145 @@ def split_realizations(
     return data_split_inds, data_trn, data_tst, data_cv
 
 
-@dataclass
-class DataScalingBias:
-    """Data scaling and bias."""
-
-    scaling_inp: Union[float, NDArray] = 1.0
-    scaling_out: Union[float, NDArray] = 1.0
-    scaling_tgt: Union[float, NDArray] = 1.0
-
-    bias_inp: Union[float, NDArray] = 0.0
-    bias_out: Union[float, NDArray] = 0.0
-    bias_tgt: Union[float, NDArray] = 0.0
-
-
-def compute_scaling_supervised(inp: NDArray, tgt: NDArray) -> DataScalingBias:
-    range_vals_inp = _get_normalization(inp, percentile=0.001)
-    range_vals_tgt = _get_normalization(tgt, percentile=0.001)
-
-    sb = DataScalingBias()
-    sb.scaling_inp = 1 / (range_vals_inp[1] - range_vals_inp[0])
-    sb.scaling_tgt = 1 / (range_vals_tgt[1] - range_vals_tgt[0])
-    sb.scaling_out = sb.scaling_tgt
-
-    sb.bias_inp = range_vals_inp[2] * sb.scaling_inp
-    sb.bias_tgt = range_vals_tgt[2] * sb.scaling_tgt
-    sb.bias_out = sb.bias_tgt
-
-    return sb
-
-
-def compute_scaling_selfsupervised(inp: NDArray) -> DataScalingBias:
-    range_vals_inp = _get_normalization(inp, percentile=0.001)
-
-    sb = DataScalingBias()
-    sb.scaling_inp = 1 / (range_vals_inp[1] - range_vals_inp[0])
-    sb.scaling_out = sb.scaling_tgt = sb.scaling_inp
-
-    sb.bias_inp = range_vals_inp[2] * sb.scaling_inp
-    sb.bias_out = sb.bias_tgt = sb.bias_inp
-
-    return sb
-
-
-class Denoiser:
-    """Denoising images."""
-
-    data_sb: DataScalingBias | None
-
-    model: pt.nn.Module
-    device: str
-
-    save_epochs_dir: str | None
-    verbose: bool
-
-    def __init__(
-        self,
-        model: NetworkParams | pt.nn.Module | Mapping | None,
-        data_scaling_bias: DataScalingBias | None = None,
-        reg_tv_val: float | None = 1e-5,
-        device: str = "cuda" if pt.cuda.is_available() else "cpu",
-        save_epochs_dir: str | None = None,
-        verbose: bool = True,
-    ) -> None:
-        """Initialize the noise2noise method.
-
-        Parameters
-        ----------
-        model : str | NetworkParams | pt.nn.Module | Mapping | None
-            Type of neural network to use or a specific network (or state) to use
-        data_scaling_inp : Union[float, None], optional
-            Scaling of the input data, by default None
-        data_scaling_tgt : Union[float, None], optional
-            Scaling of the output, by default None
-        reg_tv_val : Union[float, None], optional
-            Deep-image prior regularization value, by default 1e-5
-        device : str, optional
-            Device to use, by default "cuda" if cuda is available, otherwise "cpu"
-        save_epochs_dir : str | None, optional
-            Directory where to save network states at each epoch.
-            If None disabled, by default None
-        verbose : bool, optional
-            Whether to produce verbose output, by default True
-        """
-        # if model is None or isinstance(model, (int, Mapping)):
-        #     if isinstance(model, int):
-        #         if self.save_epochs_dir is None:
-        #             raise ValueError("Directory for saving epochs not specified")
-
-        #         state_dict = load_model_state(self.save_epochs_dir, epoch_num=model)
-        #         model = state_dict["state_dict"]
-
-        #     if isinstance(model, Mapping):
-        #         self.model.load_state_dict(model)
-        #         self.model.to(self.device)
-        #     else:
-        #         raise ValueError(f"Invalid model state: {model}")
-        # el
-        if isinstance(model, NetworkParams):
-            self.model = model.get_model()
-        elif isinstance(model, pt.nn.Module):
-            self.model = model.to(device)
-        else:
-            raise ValueError(f"Unsupported model: {model}")
-        if verbose:
-            get_num_parameters(self.model, verbose=True)
-
-        self.data_sb = data_scaling_bias
-
-        self.reg_val = reg_tv_val
-        self.device = device
-        self.save_epochs_dir = save_epochs_dir
-        self.verbose = verbose
-
-    def train_supervised(
-        self,
-        inp: NDArray,
-        tgt: NDArray,
-        epochs: int,
-        tst_inds: Sequence[int] | NDArray,
-        algo: str = "adam",
-    ):
-        """Supervised training.
-
-        Parameters
-        ----------
-        inp : NDArray
-            The input images
-        tgt : NDArray
-            The target images
-        epochs : int
-            Number of training epochs
-        tst_inds : Sequence[int] | NDArray
-            The validation set indices
-        algo : str, optional
-            Learning algorithm to use, by default "adam"
-        """
-        num_imgs = inp.shape[0]
-        tst_inds = np.array(tst_inds, dtype=int)
-        if np.any(tst_inds < 0) or np.any(tst_inds >= num_imgs):
-            raise ValueError(
-                f"Each cross-validation index should be greater or equal than 0, and less than the number of images {num_imgs}"
-            )
-        trn_inds = np.delete(np.arange(num_imgs), obj=tst_inds)
-
-        if tgt.ndim == (inp.ndim - 1):
-            tgt = np.tile(tgt[None, ...], [num_imgs, *np.ones_like(tgt.shape)])
-
-        if self.data_sb is None:
-            self.data_sb = compute_scaling_supervised(inp, tgt)
-
-        # Rescale the datasets
-        inp = inp * self.data_sb.scaling_inp - self.data_sb.bias_inp
-        tgt = tgt * self.data_sb.scaling_tgt - self.data_sb.bias_tgt
-
-        # Create datasets
-        dset_trn = (inp[trn_inds], tgt[trn_inds])
-        dset_tst = (inp[tst_inds], tgt[tst_inds])
-
-        reg = LossTV(self.reg_val, reduction="mean") if self.reg_val is not None else None
-        loss_trn, loss_tst = self._train_selfsimilar(dset_trn, dset_tst, epochs=epochs, algo=algo, regularizer=reg)
-
-        if self.verbose:
-            self._plot_loss_curves(loss_trn, loss_tst, f"Supervised {algo.upper()}")
-
-    def _train_selfsimilar(
-        self,
-        dset_trn: tuple[NDArray, NDArray],
-        dset_tst: tuple[NDArray, NDArray],
-        epochs: int,
-        algo: str = "adam",
-        regularizer: Union[LossRegularizer, None] = None,
-        lower_limit: Union[float, NDArray, None] = None,
-    ) -> tuple[NDArray, NDArray]:
-        losses_trn = []
-        losses_tst = []
-        loss_data_fn = pt.nn.MSELoss(reduction="mean")
-        optim = create_optimizer(self.model, algo=algo)
-
-        if lower_limit is not None and self.data_sb is not None:
-            lower_limit = lower_limit * self.data_sb.scaling_inp - self.data_sb.bias_inp
-
-        best_epoch = -1
-        best_loss_tst = +np.inf
-        best_state = self.model.state_dict()
-        best_optim = optim.state_dict()
-
-        inp_trn_t = _single_channel_imgs_to_tensor(dset_trn[0], device=self.device)
-        tgt_trn_t = _single_channel_imgs_to_tensor(dset_trn[1], device=self.device)
-
-        inp_tst_t = _single_channel_imgs_to_tensor(dset_tst[0], device=self.device)
-        tgt_tst_t = _single_channel_imgs_to_tensor(dset_tst[1], device=self.device)
-
-        for epoch in tqdm(range(epochs), desc=f"Training {algo.upper()}"):
-            # Train
-            self.model.train()
-
-            optim.zero_grad()
-            out_trn: pt.Tensor = self.model(inp_trn_t)
-            loss_trn = loss_data_fn(out_trn, tgt_trn_t)
-            if regularizer is not None:
-                loss_trn += regularizer(out_trn)
-            if lower_limit is not None:
-                loss_trn += pt.nn.ReLU(inplace=False)(-out_trn.flatten() + lower_limit).mean()
-            loss_trn.backward()
-
-            loss_trn_val = loss_trn.item()
-            losses_trn.append(loss_trn_val)
-
-            optim.step()
-
-            # Test
-            self.model.eval()
-            loss_tst_val = 0
-            with pt.inference_mode():
-                out_tst = self.model(inp_tst_t)
-                loss_tst = loss_data_fn(out_tst, tgt_tst_t)
-
-                loss_tst_val = loss_tst.item()
-                losses_tst.append(loss_tst_val)
-
-            # Check improvement
-            if losses_tst[-1] < best_loss_tst if losses_tst[-1] is not None else False:
-                best_loss_tst = losses_tst[-1]
-                best_epoch = epoch
-                best_state = cp.deepcopy(self.model.state_dict())
-                best_optim = cp.deepcopy(optim.state_dict())
-
-            # Save epoch
-            if self.save_epochs_dir:
-                self._save_state(epoch, self.model.state_dict(), optim.state_dict())
-
-        print(f"Best epoch: {best_epoch}, with tst_loss: {best_loss_tst:.5}")
-        if self.save_epochs_dir:
-            self._save_state(best_epoch, best_state, best_optim, is_best=True)
-
-        self.model.load_state_dict(best_state)
-
-        return np.array(losses_trn), np.array(losses_tst)
-
-    def _train_pixelmask_small(
-        self,
-        inp: NDArray,
-        tgt: NDArray,
-        mask_trn: NDArray,
-        epochs: int,
-        algo: str = "adam",
-        regularizer: Union[LossRegularizer, None] = None,
-        lower_limit: Union[float, NDArray, None] = None,
-    ) -> tuple[NDArray, NDArray]:
-        losses_trn = []
-        losses_tst = []
-        loss_data_fn = pt.nn.MSELoss(reduction="mean")
-        optim = create_optimizer(self.model, algo=algo)
-
-        if lower_limit is not None and self.data_sb is not None:
-            lower_limit = lower_limit * self.data_sb.scaling_inp - self.data_sb.bias_inp
-
-        best_epoch = -1
-        best_loss_tst = +np.inf
-        best_state = self.model.state_dict()
-        best_optim = optim.state_dict()
-
-        n_dims = inp.ndim
-
-        inp_t = _single_channel_imgs_to_tensor(inp, device=self.device)
-        tgt_trn = pt.tensor(tgt[mask_trn].astype(np.float32), device=self.device)
-        tgt_tst = pt.tensor(tgt[np.logical_not(mask_trn)].astype(np.float32), device=self.device)
-
-        mask_trn_t = pt.tensor(mask_trn, device=self.device)
-        mask_tst_t = pt.tensor(np.logical_not(mask_trn), device=self.device)
-
-        self.model.train()
-        for epoch in tqdm(range(epochs), desc=f"Training {algo.upper()}"):
-            # Train
-            optim.zero_grad()
-            out_t: pt.Tensor = self.model(inp_t)
-            if n_dims == 2:
-                out_t_mask = out_t[0, 0]
-            else:
-                out_t_mask = out_t[:, 0]
-            if tgt.ndim == 3 and out_t_mask.ndim == 2:
-                out_t_mask = pt.tile(out_t_mask[None, :, :], [tgt.shape[-3], 1, 1])
-
-            out_trn = out_t_mask[mask_trn_t].flatten()
-
-            loss_trn = loss_data_fn(out_trn, tgt_trn)
-            if regularizer is not None:
-                loss_trn += regularizer(out_t)
-            if lower_limit is not None:
-                loss_trn += pt.nn.ReLU(inplace=False)(-out_t.flatten() + lower_limit).mean()
-            loss_trn.backward()
-
-            losses_trn.append(loss_trn.item())
-            optim.step()
-
-            # Test
-            out_tst = out_t_mask[mask_tst_t]
-            loss_tst = loss_data_fn(out_tst, tgt_tst)
-            losses_tst.append(loss_tst.item())
-
-            # Check improvement
-            if losses_tst[-1] < best_loss_tst if losses_tst[-1] is not None else False:
-                best_loss_tst = losses_tst[-1]
-                best_epoch = epoch
-                best_state = cp.deepcopy(self.model.state_dict())
-                best_optim = cp.deepcopy(optim.state_dict())
-
-            # Save epoch
-            if self.save_epochs_dir is not None:
-                save_model_state(
-                    self.save_epochs_dir, epoch_num=epoch, model_state=self.model.state_dict(), optim_state=optim.state_dict()
-                )
-
-        print(f"Best epoch: {best_epoch}, with tst_loss: {best_loss_tst:.5}")
-        if self.save_epochs_dir is not None:
-            save_model_state(
-                self.save_epochs_dir, epoch_num=best_epoch, model_state=best_state, optim_state=best_optim, is_best=True
-            )
-
-        self.model.load_state_dict(best_state)
-
-        losses_trn = np.array(losses_trn)
-        losses_tst = np.array(losses_tst)
-
-        return losses_trn, losses_tst
-
-    def _save_state(self, epoch_num: int, model_state: Mapping, optim_state: Mapping, is_best: bool = False) -> None:
-        if self.save_epochs_dir is None:
-            raise ValueError("Directory for saving epochs not specified")
-
-        save_model_state(
-            self.save_epochs_dir, epoch_num=epoch_num, model_state=model_state, optim_state=optim_state, is_best=is_best
-        )
-
-    def _load_state(self, epoch_num: int | None = None) -> None:
-        if self.save_epochs_dir is None:
-            raise ValueError("Directory for saving epochs not specified")
-
-        state_dict = load_model_state(self.save_epochs_dir, epoch_num=epoch_num)
-        self.model.load_state_dict(state_dict["state_dict"])
-
-    def _plot_loss_curves(self, train_loss: NDArray, test_loss: NDArray, title: Union[str, None] = None) -> None:
-        test_argmin = int(np.argmin(test_loss))
-        fig, axs = plt.subplots(1, 1, figsize=[7, 2.6])
-        if title is not None:
-            axs.set_title(title)
-        axs.semilogy(np.arange(train_loss.size), train_loss, label="training loss")
-        axs.semilogy(np.arange(test_loss.size) + 1, test_loss, label="test loss")
-        axs.stem(test_argmin + 1, test_loss[test_argmin], linefmt="C1--", markerfmt="C1o", label=f"Best epoch: {test_argmin}")
-        axs.legend()
-        axs.grid()
-        fig.tight_layout()
-        plt.show(block=False)
-
-    def infer(self, inp: NDArray) -> NDArray:
-        """Inference, given an initial stack of images.
-
-        Parameters
-        ----------
-        inp : NDArray
-            The input stack of images
-
-        Returns
-        -------
-        NDArray
-            The denoised stack of images
-        """
-        # Rescale input
-        if self.data_sb is not None:
-            inp = inp * self.data_sb.scaling_inp - self.data_sb.bias_inp
-
-        inp_t = _single_channel_imgs_to_tensor(inp, device=self.device)
-
-        self.model.eval()
-        with pt.inference_mode():
-            out_t: pt.Tensor = self.model(inp_t)
-            output = out_t.to("cpu").numpy().reshape(inp.shape)
-
-        # Rescale output
-        if self.data_sb is not None:
-            output = (output + self.data_sb.bias_out) / self.data_sb.scaling_out
-
-        return output
-
-
-class N2N(Denoiser):
-    """Self-supervised denoising from pairs of images."""
-
-    def train_selfsupervised(
-        self, inp: NDArray, epochs: int, num_tst_ratio: float = 0.2, strategy: str = "1:X", algo: str = "adam"
-    ) -> None:
-        if self.data_sb is None:
-            self.data_sb = compute_scaling_selfsupervised(inp)
-
-        # Rescale the datasets
-        inp = inp * self.data_sb.scaling_inp - self.data_sb.bias_inp
-
-        mask_trn = np.ones_like(inp, dtype=bool)
-        rnd_inds = np.random.random_integers(low=0, high=mask_trn.size - 1, size=int(mask_trn.size * num_tst_ratio))
-        mask_trn[np.unravel_index(rnd_inds, shape=mask_trn.shape)] = False
-
-        inp_x = np.stack([np.delete(inp, obj=ii, axis=0).mean(axis=0) for ii in range(len(inp))], axis=0)
-        if strategy.upper() == "1:X":
-            tmp_inp = inp
-            tmp_tgt = inp_x
-        elif strategy.upper() == "X:1":
-            tmp_inp = inp_x
-            tmp_tgt = inp
-        else:
-            raise ValueError(f"Strategy {strategy} not implemented. Please choose one of: ['1:X', 'X:1']")
-
-        tmp_inp = tmp_inp.astype(np.float32)
-        tmp_tgt = tmp_tgt.astype(np.float32)
-
-        reg = LossTV(self.reg_val, reduction="mean") if self.reg_val is not None else None
-        losses_trn, losses_tst = self._train_pixelmask_small(
-            tmp_inp, tmp_tgt, mask_trn, epochs=epochs, algo=algo, regularizer=reg
-        )
-
-        if self.verbose:
-            self._plot_loss_curves(losses_trn, losses_tst, f"Self-supervised {self.__class__.__name__} {algo.upper()}")
-
-
-class N2G(N2N):
+def _gi_fwd(masks: pt.Tensor, image: pt.Tensor) -> pt.Tensor:
+    new_masks_shape = [*masks.shape[:-2], int(np.prod(np.array(masks.shape[-2:])))]
+    new_image_shape = [*image.shape[:-2], int(np.prod(np.array(image.shape[-2:]))), 1]
+    masks = masks.reshape(new_masks_shape)
+    image = image.reshape(new_image_shape)
+
+    out = masks.matmul(image)
+    return out.squeeze(dim=-1)
+
+
+def compute_scaling_ghost_imaging(
+    masks: NDArray, buckets: NDArray, adjust_scaling: bool = False, verbose: bool = True
+) -> DataScaleBias:
+    """
+    Compute input, output, and target data scaling and bias for the ghost imaging reconstruction.
+
+    Parameters
+    ----------
+    masks : NDArray
+        Stack of masks.
+    buckets : NDArray
+        List of buckets, corresponding to the masks.
+    adjust_scaling : bool, optional
+        If True, adjust the scaling factors of the output data to the expected perceived range (wrong though!).
+        Default is False.
+    verbose : bool, optional
+        If True, print detailed information about the scaling and bias computation process.
+        Default is True.
+
+    Returns
+    -------
+    DataScaleBias
+        An instance of DataScaleBias containing the computed scaling and bias values.
+    """
+    data_sb = DataScaleBias()
+    print("Computing least-squares reconstruction for normalization:")
+    mc = cct.struct_illum.MaskCollection(masks)
+    p = cct.struct_illum.ProjectorGhostImaging(mc)
+    rec_ls = p.fbp(buckets, adjust_scaling=adjust_scaling)
+
+    stats_det = get_normalization_range(buckets, percentile=0.01)
+    stats_rec = get_normalization_range(rec_ls, percentile=0.01)
+    if verbose:
+        print("Input ranges:")
+        print(f"- buckets: range [{stats_det[0]:.3}, {stats_det[1]:.3}], mean {stats_det[2]:.3}")
+        print(f"- reconstruction: range [{stats_rec[0]:.3}, {stats_rec[1]:.3}], mean {stats_rec[2]:.3}")
+
+    data_scaling_recs = 1 / (stats_rec[1] - stats_rec[0])
+    data_bias_recs = stats_rec[2] * data_scaling_recs
+
+    masks = masks / data_scaling_recs
+
+    mc = cct.struct_illum.MaskCollection(masks)
+    p = cct.struct_illum.ProjectorGhostImaging(mc)
+
+    data_bias_tgt = p(np.ones_like(rec_ls) * data_bias_recs)
+    buckets = buckets - data_bias_tgt
+    rec_ls = p.fbp(buckets, adjust_scaling=adjust_scaling)
+
+    stats_det = get_normalization_range(buckets, percentile=0.01)
+    stats_rec = get_normalization_range(rec_ls, percentile=0.01)
+    if verbose:
+        print("Input ranges:")
+        print(f"- buckets: range [{stats_det[0]:.3}, {stats_det[1]:.3}], mean {stats_det[2]:.3}")
+        print(f"- reconstruction: range [{stats_rec[0]:.3}, {stats_rec[1]:.3}], mean {stats_rec[2]:.3}")
+
+    refined_data_bias_recs = stats_rec[2]
+
+    data_sb.scale_out = data_scaling_recs
+    data_sb.bias_out = data_bias_recs + refined_data_bias_recs
+
+    refined_data_bias_tgt = p(np.ones_like(rec_ls) * refined_data_bias_recs)
+    buckets = buckets - refined_data_bias_tgt
+    rec_ls = p.fbp(buckets, adjust_scaling=adjust_scaling)
+
+    stats_det = get_normalization_range(buckets, percentile=0.01)
+    stats_rec = get_normalization_range(rec_ls, percentile=0.01)
+    if verbose:
+        print("Input ranges:")
+        print(f"- buckets: range [{stats_det[0]:.3}, {stats_det[1]:.3}], mean {stats_det[2]:.3}")
+        print(f"- reconstruction: range [{stats_rec[0]:.3}, {stats_rec[1]:.3}], mean {stats_rec[2]:.3}")
+
+    data_scaling_tgt = 1 / (stats_det[1] - stats_det[0])
+
+    data_sb.scale_tgt = data_scaling_tgt
+    data_sb.bias_tgt = data_bias_tgt + refined_data_bias_tgt
+
+    buckets = buckets * data_scaling_tgt
+    masks = masks * data_scaling_tgt
+
+    mc = cct.struct_illum.MaskCollection(masks)
+    p = cct.struct_illum.ProjectorGhostImaging(mc)
+
+    rec_ls = p.fbp(buckets, adjust_scaling=adjust_scaling)
+
+    stats_det = get_normalization_range(buckets, percentile=0.01)
+    stats_rec = get_normalization_range(rec_ls, percentile=0.01)
+    if verbose:
+        print("Input ranges:")
+        print(f"- buckets: range [{stats_det[0]:.3}, {stats_det[1]:.3}], mean {stats_det[2]:.3}")
+        print(f"- reconstruction: range [{stats_rec[0]:.3}, {stats_rec[1]:.3}], mean {stats_rec[2]:.3}")
+
+    return data_sb
+
+
+class N2G(Denoiser):
     """Perform self-supervised reconstruction of GI."""
-
-    def _fwd(self, masks: pt.Tensor, image: pt.Tensor) -> pt.Tensor:
-        new_masks_shape = [*masks.shape[:-2], int(np.prod(np.array(masks.shape[-2:])))]
-        new_image_shape = [*image.shape[:-2], int(np.prod(np.array(image.shape[-2:]))), 1]
-        masks = masks.reshape(new_masks_shape)
-        image = image.reshape(new_image_shape)
-
-        out = masks.matmul(image)
-        return out.squeeze(dim=-1)
 
     def prepare_data(
         self,
         inp_masks: NDArray,
         inp_buckets: NDArray,
-        num_splits: Union[int, None] = 4,
+        num_splits: int | None = 4,
         num_perms: int = 1,
         tst_fraction: float = 0.1,
         cv_fraction: float = 0.1,
         force_scaling: bool = True,
-    ) -> Sequence:
+    ) -> tuple[NDArray, tuple[NDArray, NDArray], tuple[NDArray, NDArray], tuple[NDArray, NDArray], NDArray]:
         adjust_scaling = False
 
         if self.data_sb is None or force_scaling:
-            self.data_sb = DataScalingBias()
+            self.data_sb = compute_scaling_ghost_imaging(inp_masks, inp_buckets, adjust_scaling=adjust_scaling)
 
-            print("Computing least-squares reconstruction for normalization:")
-            mc = cct.struct_illum.MaskCollection(inp_masks)
-            p = cct.struct_illum.ProjectorGhostImaging(mc)
-            rec_ls = p.fbp(inp_buckets, adjust_scaling=adjust_scaling)
+        inp_buckets = inp_buckets - self.data_sb.bias_tgt
 
-            range_vals_det = _get_normalization(inp_buckets, percentile=0.01)
-            range_vals_rec = _get_normalization(rec_ls, percentile=0.01)
-            if self.verbose:
-                print("Input ranges:")
-                print(f"- buckets: min {range_vals_det[0]:.3}, max {range_vals_det[1]:.3}, mean {range_vals_det[2]:.3}")
-                print(f"- reconstruction: min {range_vals_rec[0]:.3}, max {range_vals_rec[1]:.3}, mean {range_vals_rec[2]:.3}")
+        inp_buckets = inp_buckets * self.data_sb.scale_tgt
+        inp_masks = inp_masks * self.data_sb.scale_tgt / self.data_sb.scale_out
 
-            data_scaling_recs = 1 / (range_vals_rec[1] - range_vals_rec[0])
-            data_bias_recs = range_vals_rec[2] * data_scaling_recs
-
-            self.data_sb.scaling_out = data_scaling_recs
-            self.data_sb.bias_out = data_bias_recs
-
-            inp_masks = inp_masks / data_scaling_recs
-
-            mc = cct.struct_illum.MaskCollection(inp_masks)
-            p = cct.struct_illum.ProjectorGhostImaging(mc)
-
-            data_bias_det = p(np.ones_like(rec_ls) * data_bias_recs)
-            inp_buckets = inp_buckets - data_bias_det
-            rec_ls = p.fbp(inp_buckets, adjust_scaling=adjust_scaling)
-
-            range_vals_det = _get_normalization(inp_buckets, percentile=0.01)
-            range_vals_rec = _get_normalization(rec_ls, percentile=0.01)
-            if self.verbose:
-                print("Input ranges:")
-                print(f"- buckets: min {range_vals_det[0]:.3}, max {range_vals_det[1]:.3}, mean {range_vals_det[2]:.3}")
-                print(f"- reconstruction: min {range_vals_rec[0]:.3}, max {range_vals_rec[1]:.3}, mean {range_vals_rec[2]:.3}")
-
-            self.data_sb.scaling_tgt = 1 / (range_vals_det[1] - range_vals_det[0])
-            inp_buckets = inp_buckets * self.data_sb.scaling_tgt
-            inp_masks = inp_masks * self.data_sb.scaling_tgt
-
+        if self.verbose and not (self.data_sb is None or force_scaling):
             mc = cct.struct_illum.MaskCollection(inp_masks)
             p = cct.struct_illum.ProjectorGhostImaging(mc)
 
             rec_ls = p.fbp(inp_buckets, adjust_scaling=adjust_scaling)
 
-            range_vals_det = _get_normalization(inp_buckets, percentile=0.01)
-            range_vals_rec = _get_normalization(rec_ls, percentile=0.01)
-            if self.verbose:
-                print("Input ranges:")
-                print(f"- buckets: min {range_vals_det[0]:.3}, max {range_vals_det[1]:.3}, mean {range_vals_det[2]:.3}")
-                print(f"- reconstruction: min {range_vals_rec[0]:.3}, max {range_vals_rec[1]:.3}, mean {range_vals_rec[2]:.3}")
+            stats_det = get_normalization_range(inp_buckets, percentile=0.01)
+            stats_rec = get_normalization_range(rec_ls, percentile=0.01)
+            print("Input ranges:")
+            print(f"- buckets: range [{stats_det[0]:.3}, {stats_det[1]:.3}], mean {stats_det[2]:.3}")
+            print(f"- reconstruction: range [{stats_rec[0]:.3}, {stats_rec[1]:.3}], mean {stats_rec[2]:.3}")
 
         data_trn_split, data_trn_tgt, data_tst_tgt, data_cv_tgt = split_realizations(
             masks=inp_masks,
@@ -673,30 +299,32 @@ class N2G(N2N):
         self,
         inp_trn_r: NDArray,
         tgt_trn_mb: tuple[NDArray, NDArray],
-        tgt_trn_inds: Union[Sequence[NDArray], None],
+        tgt_trn_inds: NDArray | None,
         tgt_tst_mb: tuple[NDArray, NDArray],
         epochs: int,
         algo: str = "adam",
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-2,
-        lower_limit: Union[float, NDArray, None] = None,
-    ) -> tuple[NDArray, NDArray]:
+        lower_limit: float | NDArray | None = None,
+    ) -> dict[str, NDArray]:
         if epochs < 1:
             raise ValueError(f"Number of epochs should be >= 1, but {epochs} was passed")
 
         losses_trn = []
         losses_tst = []
+        losses_tst_sbi = []
+
+        loss_data_fn = nn.MSELoss(reduction="sum")
+        loss_reg_fn = self._get_regularization()
+        optim = create_optimizer(self.model, algo=algo, learning_rate=learning_rate, weight_decay=weight_decay)
 
         if lower_limit is not None and self.data_sb is not None:
-            lower_limit = lower_limit * self.data_sb.scaling_out - self.data_sb.bias_out
-
-        loss_data_fn = nn.MSELoss(reduction="mean")
-        loss_tv_fn = LossTV(lambda_val=self.reg_val) if self.reg_val is not None else None
+            lower_limit = lower_limit * self.data_sb.scale_out - self.data_sb.bias_out
 
         best_epoch = -1
         best_loss_tst = +np.inf
         best_state = self.model.state_dict()
-        optim = create_optimizer(self.model, algo=algo, learning_rate=learning_rate, weight_decay=weight_decay)
+        best_optim = optim.state_dict()
 
         if tgt_trn_inds is not None:
             tgt_trn_b = np.stack([tgt_trn_mb[1][inds] for inds in tgt_trn_inds], axis=0)
@@ -709,8 +337,10 @@ class N2G(N2N):
 
         tgt_tst_m_t = pt.tensor(tgt_tst_mb[0].astype(np.float32), device=self.device)
         tgt_tst_b_t = pt.tensor(tgt_tst_mb[1].astype(np.float32), device=self.device)
+        tgt_tst_b_t_sbi = (tgt_tst_b_t - tgt_tst_b_t.mean()) / (tgt_tst_b_t.std() + 1e-5)
 
-        all_num_chunks = _compute_num_chunks(epochs, num_inps=inp_trn_r_t.shape[0])
+        num_inp_recs = inp_trn_r_t.shape[0]
+        all_num_chunks = _compute_num_chunks(epochs, num_inps=num_inp_recs)
         previous_chunks = all_num_chunks[0] * 2
 
         for epoch in trange(epochs, desc=f"Training {algo.upper()}", disable=(not self.verbose)):
@@ -731,9 +361,8 @@ class N2G(N2N):
 
                 # Compute network's output
                 tmp_trn_i = self.model(inp_trn_r_ep_ch)
-
                 # Compute residual on target
-                tmp_trn_b = self._fwd(tgt_trn_m_t, tmp_trn_i[..., 0, :, :])
+                tmp_trn_b = _gi_fwd(tgt_trn_m_t, tmp_trn_i[..., 0, :, :])
 
                 if tgt_trn_inds is not None:
                     tmp_trn_b = pt.stack(
@@ -747,24 +376,20 @@ class N2G(N2N):
                     tmp_trn_i = pt.concatenate((tmp_trn_i, tmp_trn_i.mean(dim=0, keepdim=True)), dim=0)
 
                 loss_trn = loss_data_fn(tmp_trn_b, tgt_tmp_b)
-                if loss_tv_fn is not None:
-                    loss_trn += loss_tv_fn(tmp_trn_i)
+                if loss_reg_fn is not None:
+                    loss_trn += loss_reg_fn(tmp_trn_i)
                 if lower_limit is not None:
                     loss_trn += nn.ReLU(inplace=False)(-tmp_trn_i.flatten() + lower_limit).mean()
-                # if num_chunks > 1:
-                #     s = pt.linalg.svdvals(tmp_trn_i.reshape([tmp_trn_i.shape[0], -1]))
-                #     loss_trn += 1e-7 * pt.linalg.norm(s[1:], ord=1)
 
                 loss_trn.backward()
                 loss_trn_val += loss_trn.item()
 
-                for pars in self.model.parameters():
-                    pars.grad[pt.logical_not(pt.isfinite(pars.grad))] = 0.0
-                # nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.1)
+                fix_invalid_gradient_values(self.model)
+                # nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
 
                 optim.step()
 
-            loss_trn_val /= num_chunks
+            loss_trn_val /= num_inp_recs
             losses_trn.append(loss_trn_val)
 
             # Test
@@ -774,11 +399,14 @@ class N2G(N2N):
                 tmp_tst_i = self.model(inp_trn_r_t)
 
                 # Compute residual on target
-                tmp_tst_b = self._fwd(tgt_tst_m_t, tmp_tst_i.mean(dim=(0, 1)))
-                loss_tst = loss_data_fn(tmp_tst_b, tgt_tst_b_t)
+                tmp_tst_b = _gi_fwd(tgt_tst_m_t, tmp_tst_i.mean(dim=(0, 1)))
 
-                loss_tst_val = loss_tst.item()
-                losses_tst.append(loss_tst_val)
+                loss_tst = loss_data_fn(tmp_tst_b, tgt_tst_b_t)
+                losses_tst.append(loss_tst.item())
+
+                tmp_tst_b_sbi = (tmp_tst_b - tmp_tst_b.mean()) / (tmp_tst_b.std() + 1e-5)
+                loss_tst_sbi = loss_data_fn(tmp_tst_b_sbi, tgt_tst_b_t_sbi)
+                losses_tst_sbi.append(loss_tst_sbi.item())
 
             # Check improvement
             if losses_tst[-1] < best_loss_tst if losses_tst[-1] is not None else False:
@@ -789,16 +417,16 @@ class N2G(N2N):
 
             # Save epoch
             if self.save_epochs_dir is not None:
-                self._save_state(epoch, self.model.state_dict(), optim.state_dict())
+                self._save_state(epoch_num=epoch, optim_state=optim.state_dict())
 
             # if epoch in [1, 50, 100, 500, 1000, 2000, 5000, 10000, 20000, epochs - 1]:
             if self.verbose and epoch in [1000, 2000, 5000, 10000, 20000, epochs - 1]:
                 tmp_trn_i = self.model(inp_trn_r_t)
                 # tmp_trn_i, latent = self.model(inp_trn_r_t, return_latent=True)
-                tmp_trn_b = self._fwd(tgt_trn_m_t, tmp_trn_i[..., 0, :, :])
+                tmp_trn_b = _gi_fwd(tgt_trn_m_t, tmp_trn_i[..., 0, :, :])
                 # latent_l1_norm = pt.linalg.vector_norm(latent, ord=1) / latent.numel()
                 print(
-                    f"It {epoch}: loss_trn = {loss_trn_val:.5}, loss_tst = {loss_tst_val:.5}"
+                    f"It {epoch}: loss_trn = {loss_trn_val:.5}, loss_tst = {losses_tst[-1]:.5}"
                     f" (best: {best_loss_tst:.5}, ep: {best_epoch})"
                 )  # , l1 = {latent_l1_norm:.5}
 
@@ -818,43 +446,64 @@ class N2G(N2N):
                 axs[3].set_title("buckets")
                 fig.tight_layout()
 
+        self.model.load_state_dict(best_state)
+
         if self.verbose:
             print(f"Best epoch: {best_epoch}, with tst_loss: {best_loss_tst:.5}")
         if self.save_epochs_dir is not None:
-            save_model_state(
-                self.save_epochs_dir, epoch_num=best_epoch, model_state=best_state, optim_state=best_optim, is_best=True
-            )
+            self._save_state(epoch_num=best_epoch, optim_state=best_optim, is_best=True)
 
-        self.model.load_state_dict(best_state)
+        losses = dict(loss_trn=np.array(losses_trn), loss_tst=np.array(losses_tst), loss_tst_sbi=np.array(losses_tst_sbi))
 
-        losses_trn = np.array(losses_trn)
-        losses_tst = np.array(losses_tst)
-        self._plot_loss_curves(losses_trn, losses_tst, f"Self-supervised {self.__class__.__name__} {algo.upper()}")
+        self._plot_loss_curves(losses, f"Self-supervised {self.__class__.__name__} {algo.upper()}")
 
-        return losses_trn, losses_tst
+        return losses
 
 
 class INR(Denoiser):
     """Perform INR reconstruction of GI."""
 
-    data_sb: DataScalingBias | None
-
-    model: pt.nn.Module | SIREN
-    device: str
-
-    save_epochs_dir: str | None
-    verbose: bool
+    model: SIREN
+    encoder: PositionalEncoder
 
     def __init__(
         self,
-        model: NetworkParams | SIREN,
-        data_scaling_bias: DataScalingBias | None = None,
-        reg_tv_val: float | None = 1e-5,
+        model: NetworkParamsINR | SIREN,
+        data_scaling_bias: DataScaleBias | None = None,
+        encoder: PositionalEncoder | None = None,
+        reg_val: float | None = 1e-5,
         device: str = "cuda" if pt.cuda.is_available() else "cpu",
         save_epochs_dir: str | None = None,
         verbose: bool = True,
     ) -> None:
-        if isinstance(model, NetworkParams):
+        """
+        Initialize the Implicit Neural Representation (INR) based reconstruction algorithm.
+
+        Parameters
+        ----------
+        model : NetworkParamsINR | SIREN
+            The neural network model to be used. It can be an instance of
+            `NetworkParamsINR` or `SIREN`.
+        data_scaling_bias : DataScaleBias | None, optional
+            An optional data scaling and bias object, by default None.
+        encoder : PositionalEncoder | None, optional
+            An optional positional encoder, by default None.
+        reg_val : float | None, optional
+            Regularization value, by default 1e-5.
+        device : str, optional
+            The device to run the model on, either 'cuda' or 'cpu', by default
+            "cuda" if CUDA is available, otherwise "cpu".
+        save_epochs_dir : str | None, optional
+            Directory to save model checkpoints, by default None.
+        verbose : bool, optional
+            If True, print verbose output, by default True.
+
+        Raises
+        ------
+        ValueError
+            If the provided model is not supported.
+        """
+        if isinstance(model, NetworkParamsINR):
             self.model = model.get_model(device=device)
         elif isinstance(model, SIREN):
             self.model = model.to(device)
@@ -863,25 +512,17 @@ class INR(Denoiser):
             raise ValueError(f"Unsupported model: {model}")
         if verbose:
             get_num_parameters(self.model, verbose=True)
-        self.embedder = PositionalEncoder(
-            num_embeddings=self.model.n_embeddings, ndims=self.model.n_channels_in, device=device
-        )
+
+        if encoder is None:
+            encoder = PositionalEncoder(num_embeddings=self.model.n_embeddings, ndims=self.model.n_channels_in, device=device)
+        self.encoder = encoder
 
         self.data_sb = data_scaling_bias
 
-        self.reg_val = reg_tv_val
+        self.reg_val = reg_val
         self.device = device
         self.save_epochs_dir = save_epochs_dir
         self.verbose = verbose
-
-    def _fwd(self, masks: pt.Tensor, image: pt.Tensor) -> pt.Tensor:
-        new_masks_shape = [*masks.shape[:-2], int(np.prod(np.array(masks.shape[-2:])))]
-        new_image_shape = [*image.shape[:-2], int(np.prod(np.array(image.shape[-2:]))), 1]
-        masks = masks.reshape(new_masks_shape)
-        image = image.reshape(new_image_shape)
-
-        out = masks.matmul(image)
-        return out.squeeze(dim=-1)
 
     def prepare_data(
         self,
@@ -889,66 +530,68 @@ class INR(Denoiser):
         inp_buckets: NDArray,
         tst_fraction: float = 0.1,
         cv_fraction: float = 0.1,
-        force_scaling: bool = True,
-    ) -> Sequence:
+        force_scaling: bool = False,
+    ) -> tuple[pt.Tensor, tuple[NDArray, NDArray], tuple[NDArray, NDArray], tuple[NDArray, NDArray]]:
+        """
+        Prepare the data for training, testing, and validation.
+
+        Parameters
+        ----------
+        inp_masks : NDArray
+            Input masks array.
+        inp_buckets : NDArray
+            Input buckets array.
+        tst_fraction : float, optional
+            Fraction of the data to be used for testing, by default 0.1.
+        cv_fraction : float, optional
+            Fraction of the data to be used for cross-validation, by default 0.1.
+        force_scaling : bool, optional
+            If True, forces the computation of data scaling and bias, by default False
+            .
+
+        Returns
+        -------
+        tuple
+            A tuple containing:
+            - encode_grid : pt.Tensor
+                The encoded grid for the neural network.
+            - data_trn_tgt : tuple[NDArray, NDArray]
+                Training data (masks and buckets).
+            - data_tst_tgt : tuple[NDArray, NDArray]
+                Testing data (masks and buckets).
+            - data_val_tgt : tuple[NDArray, NDArray]
+                Validation data (masks and buckets).
+
+        Notes
+        -----
+        This method scales the input masks and buckets, splits the data into training,
+        testing, and validation sets, and encodes the grid for the neural network.
+        """
         adjust_scaling = False
 
         if self.data_sb is None or force_scaling:
-            self.data_sb = DataScalingBias()
+            self.data_sb = compute_scaling_ghost_imaging(inp_masks, inp_buckets, adjust_scaling=adjust_scaling)
 
-            print("Computing least-squares reconstruction for normalization:")
-            mc = cct.struct_illum.MaskCollection(inp_masks)
-            p = cct.struct_illum.ProjectorGhostImaging(mc)
-            rec_ls = p.fbp(inp_buckets, adjust_scaling=adjust_scaling)
+        inp_buckets = inp_buckets - self.data_sb.bias_tgt
 
-            range_vals_det = _get_normalization(inp_buckets, percentile=0.01)
-            range_vals_rec = _get_normalization(rec_ls, percentile=0.01)
-            if self.verbose:
-                print("Input ranges:")
-                print(f"- buckets: min {range_vals_det[0]:.3}, max {range_vals_det[1]:.3}, mean {range_vals_det[2]:.3}")
-                print(f"- reconstruction: min {range_vals_rec[0]:.3}, max {range_vals_rec[1]:.3}, mean {range_vals_rec[2]:.3}")
+        inp_buckets = inp_buckets * self.data_sb.scale_tgt
+        inp_masks = inp_masks * self.data_sb.scale_tgt / self.data_sb.scale_out
 
-            data_scaling_recs = 1 / (range_vals_rec[1] - range_vals_rec[0])
-            data_bias_recs = range_vals_rec[2] * data_scaling_recs
-
-            self.data_sb.scaling_out = data_scaling_recs
-            self.data_sb.bias_out = data_bias_recs
-
-            inp_masks = inp_masks / data_scaling_recs
-
-            mc = cct.struct_illum.MaskCollection(inp_masks)
-            p = cct.struct_illum.ProjectorGhostImaging(mc)
-
-            data_bias_det = p(np.ones_like(rec_ls) * data_bias_recs)
-            inp_buckets = inp_buckets - data_bias_det
-            rec_ls = p.fbp(inp_buckets, adjust_scaling=adjust_scaling)
-
-            range_vals_det = _get_normalization(inp_buckets, percentile=0.01)
-            range_vals_rec = _get_normalization(rec_ls, percentile=0.01)
-            if self.verbose:
-                print("Input ranges:")
-                print(f"- buckets: min {range_vals_det[0]:.3}, max {range_vals_det[1]:.3}, mean {range_vals_det[2]:.3}")
-                print(f"- reconstruction: min {range_vals_rec[0]:.3}, max {range_vals_rec[1]:.3}, mean {range_vals_rec[2]:.3}")
-
-            self.data_sb.scaling_tgt = 1 / (range_vals_det[1] - range_vals_det[0])
-            inp_buckets = inp_buckets * self.data_sb.scaling_tgt
-            inp_masks = inp_masks * self.data_sb.scaling_tgt
-
+        if self.verbose and not (self.data_sb is None or force_scaling):
             mc = cct.struct_illum.MaskCollection(inp_masks)
             p = cct.struct_illum.ProjectorGhostImaging(mc)
 
             rec_ls = p.fbp(inp_buckets, adjust_scaling=adjust_scaling)
 
-            range_vals_det = _get_normalization(inp_buckets, percentile=0.01)
-            range_vals_rec = _get_normalization(rec_ls, percentile=0.01)
-            if self.verbose:
-                print("Input ranges:")
-                print(f"- buckets: min {range_vals_det[0]:.3}, max {range_vals_det[1]:.3}, mean {range_vals_det[2]:.3}")
-                print(f"- reconstruction: min {range_vals_rec[0]:.3}, max {range_vals_rec[1]:.3}, mean {range_vals_rec[2]:.3}")
+            stats_det = get_normalization_range(inp_buckets, percentile=0.01)
+            stats_rec = get_normalization_range(rec_ls, percentile=0.01)
+            print("Input ranges:")
+            print(f"- buckets: range [{stats_det[0]:.3}, {stats_det[1]:.3}], mean {stats_det[2]:.3}")
+            print(f"- reconstruction: range [{stats_rec[0]:.3}, {stats_rec[1]:.3}], mean {stats_rec[2]:.3}")
 
-        grid = self.embedder.create_grid(inp_masks.shape[-2:])
+        grid = self.encoder.create_grid(inp_masks.shape[-2:])
         print(f'grid shape: {grid.shape}')
-        encode_grid = self.embedder.embed(grid)
+        encode_grid = self.encoder.embed(grid)
         print(f'encode_grid shape: {encode_grid.shape}')
 
         tot_realizations = len(inp_buckets)
@@ -981,36 +624,83 @@ class INR(Denoiser):
     def train(
         self,
         encode_grid: pt.Tensor,
-        tgt_trn_mb: NDArray,
-        tgt_tst_mb: NDArray,
+        tgt_trn_mb: tuple[NDArray, NDArray],
+        tgt_tst_mb: tuple[NDArray, NDArray],
         epochs: int,
         algo: str = "adam",
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-2,
-        lower_limit: Union[float, NDArray, None] = None,
-    ) -> tuple[NDArray, NDArray]:
+        lower_limit: float | NDArray | None = None,
+    ) -> dict[str, NDArray]:
+        """
+        Train the Implicit Neural Representation (INR) model.
+
+        Parameters
+        ----------
+        encode_grid : pt.Tensor
+            The encoded grid for the neural network.
+        tgt_trn_mb : tuple[NDArray, NDArray]
+            Training data (masks and buckets).
+        tgt_tst_mb : tuple[NDArray, NDArray]
+            Testing data (masks and buckets).
+        epochs : int
+            Number of training epochs.
+        algo : str, optional
+            Optimization algorithm to use, by default "adam".
+        learning_rate : float, optional
+            Learning rate for the optimizer, by default 1e-4.
+        weight_decay : float, optional
+            Weight decay for the optimizer, by default 1e-2.
+        lower_limit : float | NDArray | None, optional
+            Lower limit constraint for the model output, by default None.
+
+        Returns
+        -------
+        dict[str, NDArray]
+            A dictionary containing the training and testing losses:
+            - loss_trn : NDArray
+                Training losses for each epoch.
+            - loss_tst : NDArray
+                Testing losses for each epoch.
+            - loss_tst_sbi : NDArray
+                Standardized testing losses for each epoch.
+
+        Raises
+        ------
+        ValueError
+            If the number of epochs is less than 1.
+
+        Notes
+        -----
+        This method trains the INR model using the provided training and testing data.
+        It supports different optimization algorithms and includes regularization and
+        lower limit constraints if specified.
+        """
         if epochs < 1:
             raise ValueError(f"Number of epochs should be >= 1, but {epochs} was passed")
 
         losses_trn = []
         losses_tst = []
-
-        if lower_limit is not None and self.data_sb is not None:
-            lower_limit = lower_limit * self.data_sb.scaling_out - self.data_sb.bias_out
+        losses_tst_sbi = []
 
         loss_data_fn = nn.MSELoss(reduction="mean")
-        loss_tv_fn = LossTV(lambda_val=self.reg_val) if self.reg_val is not None else None
+        loss_reg_fn = self._get_regularization()
+        optim = create_optimizer(self.model, algo=algo, learning_rate=learning_rate, weight_decay=weight_decay)
+
+        if lower_limit is not None and self.data_sb is not None:
+            lower_limit = lower_limit * self.data_sb.scale_out - self.data_sb.bias_out
 
         best_epoch = -1
         best_loss_tst = +np.inf
         best_state = self.model.state_dict()
-        optim = create_optimizer(self.model, algo=algo, learning_rate=learning_rate, weight_decay=weight_decay)
+        best_optim = optim.state_dict()
 
         tgt_trn_m_t = pt.tensor(tgt_trn_mb[0].astype(np.float32), device=self.device, requires_grad=True)
         tgt_trn_b_t = pt.tensor(tgt_trn_mb[1].astype(np.float32), device=self.device)
 
         tgt_tst_m_t = pt.tensor(tgt_tst_mb[0].astype(np.float32), device=self.device)
         tgt_tst_b_t = pt.tensor(tgt_tst_mb[1].astype(np.float32), device=self.device)
+        tgt_tst_b_t_sbi = (tgt_tst_b_t - tgt_tst_b_t.mean()) / (tgt_tst_b_t.std() + 1e-5)
 
         for epoch in trange(epochs, desc=f"Training {algo.upper()}", disable=(not self.verbose)):
             # Train
@@ -1023,22 +713,18 @@ class INR(Denoiser):
             tmp_trn_i = tmp_trn_i.reshape([1, 1, *tgt_trn_m_t.shape[-2:]])
 
             # Compute residual on target
-            tmp_trn_b = self._fwd(tgt_trn_m_t, tmp_trn_i)
+            tmp_trn_b = _gi_fwd(tgt_trn_m_t, tmp_trn_i)
 
             loss_trn = loss_data_fn(tmp_trn_b, tgt_trn_b_t)
-            if loss_tv_fn is not None:
-                loss_trn += loss_tv_fn(tmp_trn_i)
+            if loss_reg_fn is not None:
+                loss_trn += loss_reg_fn(tmp_trn_i)
             if lower_limit is not None:
                 loss_trn += nn.ReLU(inplace=False)(-tmp_trn_i.flatten() + lower_limit).mean()
 
             loss_trn.backward()
             loss_trn_val = loss_trn.item()
-            # if self.bail_on_bad_gradient and not all([bool(pt.all(pt.isfinite(p.grad))) for p in self.model.parameters()]):
-            #     print(f"Non-finite gradient at {epoch = }! Bailing out...")
-            #     break
-            # else:
-            for pars in self.model.parameters():
-                pars.grad[pt.logical_not(pt.isfinite(pars.grad))] = 0.0
+
+            fix_invalid_gradient_values(self.model)
 
             optim.step()
 
@@ -1052,11 +738,15 @@ class INR(Denoiser):
                 tmp_tst_i = tmp_trn_i.reshape([1, 1, *tgt_trn_m_t.shape[-2:]])
 
                 # Compute residual on target
-                tmp_tst_b = self._fwd(tgt_tst_m_t, tmp_tst_i.mean(dim=(0, 1)))
+                tmp_tst_b = _gi_fwd(tgt_tst_m_t, tmp_tst_i.mean(dim=(0, 1)))
                 loss_tst = loss_data_fn(tmp_tst_b, tgt_tst_b_t)
 
                 loss_tst_val = loss_tst.item()
                 losses_tst.append(loss_tst_val)
+
+                tmp_tst_b_sbi = (tmp_tst_b - tmp_tst_b.mean()) / (tmp_tst_b.std() + 1e-5)
+                loss_tst_sbi = loss_data_fn(tmp_tst_b_sbi, tgt_tst_b_t_sbi)
+                losses_tst_sbi.append(loss_tst_sbi.item())
 
             # Check improvement
             if losses_tst[-1] < best_loss_tst if losses_tst[-1] is not None else False:
@@ -1067,14 +757,14 @@ class INR(Denoiser):
 
             # Save epoch
             if self.save_epochs_dir is not None:
-                self._save_state(epoch, self.model.state_dict(), optim.state_dict())
+                self._save_state(epoch, optim.state_dict())
 
             # if epoch in [1, 50, 100, 500, 1000, 2000, 5000, 10000, 20000, epochs - 1]:
             if self.verbose and epoch in [1000, 2000, 5000, 10000, 20000, epochs - 1]:
                 tmp_trn_i = self.model(encode_grid)
                 tmp_trn_i = tmp_trn_i.reshape([1, 1, *tgt_trn_m_t.shape[-2:]])
                 # tmp_trn_i, latent = self.model(inp_trn_r_t, return_latent=True)
-                tmp_trn_b = self._fwd(tgt_trn_m_t, tmp_trn_i.mean(dim=(0, 1)))
+                tmp_trn_b = _gi_fwd(tgt_trn_m_t, tmp_trn_i.mean(dim=(0, 1)))
                 # latent_l1_norm = pt.linalg.vector_norm(latent, ord=1) / latent.numel()
                 print(
                     f"It {epoch}: loss_trn = {loss_trn_val:.5}, loss_tst = {loss_tst_val:.5}"
@@ -1095,41 +785,81 @@ class INR(Denoiser):
                 axs[2].set_title("buckets")
                 fig.tight_layout()
 
+        self.model.load_state_dict(best_state)
+
         if self.verbose:
             print(f"Best epoch: {best_epoch}, with tst_loss: {best_loss_tst:.5}")
         if self.save_epochs_dir is not None:
-            save_model_state(
-                self.save_epochs_dir, epoch_num=best_epoch, model_state=best_state, optim_state=best_optim, is_best=True
-            )
+            self._save_state(epoch_num=best_epoch, optim_state=best_optim, is_best=True)
 
-        self.model.load_state_dict(best_state)
+        losses = dict(loss_trn=np.array(losses_trn), loss_tst=np.array(losses_tst), loss_tst_sbi=np.array(losses_tst_sbi))
 
-        losses_trn = np.array(losses_trn)
-        losses_tst = np.array(losses_tst)
-        self._plot_loss_curves(losses_trn, losses_tst, f"Self-supervised {self.__class__.__name__} {algo.upper()}")
+        self._plot_loss_curves(losses, f"Unsupervised (INR) {self.__class__.__name__} {algo.upper()}")
 
-        return losses_trn, losses_tst
+        return losses
 
-    def infer(self, encoded_grid: pt.Tensor) -> NDArray:
-        """Inference, given an initial stack of images.
+    def infer(self, inp: pt.Tensor) -> NDArray:
+        """
+        Inference, given an encoded coordinate grid.
 
         Parameters
         ----------
-        inp : NDArray
-            The input stack of images
+        inp : pt.Tensor
+            The encoded coordinate grid.
 
         Returns
         -------
         NDArray
-            The denoised stack of images
+            The reconstructed image.
         """
         self.model.eval()
         with pt.inference_mode():
-            out_t: pt.Tensor = self.model(encoded_grid)
+            out_t: pt.Tensor = self.model(inp)
             output = out_t.to("cpu").numpy()
 
         # Rescale output
         if self.data_sb is not None:
-            output = (output + self.data_sb.bias_out) / self.data_sb.scaling_out
+            output = (output + self.data_sb.bias_out) / self.data_sb.scale_out
 
         return output
+
+
+def post_process_scale_bias(
+    out_rec: NDArray,
+    inp_masks: NDArray | cct.struct_illum.MaskCollection | cct.struct_illum.ProjectorGhostImaging,
+    inp_buckets: NDArray,
+    verbose: bool = False,
+) -> NDArray:
+    """
+    Post-process the reconstructed image by fitting and applying the correct scale and bias (according to the data).
+
+    Parameters
+    ----------
+    out_rec : NDArray
+        The reconstructed image to be post-processed.
+    inp_masks : NDArray | cct.struct_illum.MaskCollection | cct.struct_illum.ProjectorGhostImaging,
+        The input masks or projector used for the reconstruction.
+    inp_buckets : NDArray
+        The input buckets used for the reconstruction.
+    verbose : bool, optional
+        If True, print the fitted scale and bias values. Default is False.
+
+    Returns
+    -------
+    NDArray
+        The post-processed image with the scale and bias applied.
+
+    Notes
+    -----
+    This function takes a reconstructed image and applies a scale and bias to it based on the input masks and buckets.
+    The scale and bias are fitted using the `fit_scale_bias` function from the `cct.processing.post` module.
+    """
+    if isinstance(inp_masks, cct.struct_illum.ProjectorGhostImaging):
+        prj = inp_masks
+    else:
+        prj = cct.struct_illum.ProjectorGhostImaging(inp_masks)
+
+    scale, bias = cct.processing.post.fit_scale_bias(out_rec, inp_buckets, prj)
+    if verbose:
+        print(f"Fitted: {scale = }, {bias = }")
+    return out_rec * scale + bias

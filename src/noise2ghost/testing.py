@@ -3,33 +3,29 @@ Testing utilities.
 """
 
 import shutil
-from datetime import datetime as dt
-
 from collections.abc import Sequence
+from datetime import datetime as dt
 from pathlib import Path
-from typing import Optional
 
 import corrct as cct
 import numpy as np
 import skimage.color as skc
-import skimage.io as skio
-
 import skimage.data as skd
+import skimage.io as skio
 import skimage.transform as skt
 from numpy.typing import DTypeLike, NDArray
-from skimage.metrics import peak_signal_noise_ratio as psnr
 from skimage.metrics import mean_squared_error as mse
+from skimage.metrics import peak_signal_noise_ratio as psnr
 from tqdm.auto import tqdm
 
-from .reconstructions import get_reconstruction
-from .io import DataGI
-
+from noise2ghost.io import DataGI
+from noise2ghost.reconstructions import reconstruct_variational
 
 DATASETS_DIR = Path("data/datasets/").expanduser()
 
 
 def _create_phantom(
-    shape_fov: Optional[Sequence[int]] = None, phantom_type: str = "chromosomes", dtype: DTypeLike = np.float32
+    shape_fov: Sequence[int] | None = None, phantom_type: str = "chromosomes", dtype: DTypeLike = np.float32
 ) -> tuple[NDArray, NDArray, NDArray]:
     print(f"Creating a new dataset for {phantom_type = }")
     if phantom_type.lower() == "dots":
@@ -83,6 +79,7 @@ def _get_dataset_filename(info: dict, extension: str = "h5") -> str:
 
 
 def compute_noise_level(buckets_clean: NDArray, buckets: NDArray, compute_variances: bool = False) -> tuple[NDArray, NDArray]:
+    buckets = np.array(buckets, ndmin=2)
     bkt_cln_std = buckets_clean.std(axis=-1)
     bkt_err_std = np.std(buckets - buckets_clean, axis=-1)
     bkt_err_std_perc = bkt_err_std / bkt_cln_std
@@ -90,25 +87,17 @@ def compute_noise_level(buckets_clean: NDArray, buckets: NDArray, compute_varian
     multiplicity = bkt_err_std.size
     b_psnr = np.zeros(multiplicity)
     b_mse = np.zeros(multiplicity)
-    if multiplicity > 1:
-        for ii in range(multiplicity):
-            if buckets_clean.ndim > 1:
-                b_psnr[ii] = psnr(
-                    buckets_clean[ii], buckets[ii], data_range=(buckets_clean[ii].max() - buckets_clean[ii].min())
-                )
-                b_mse[ii] = mse(buckets_clean[ii] - mean_bucket_value[ii], buckets[ii] - mean_bucket_value[ii])
-                print(f"Bucket std: {bkt_cln_std[ii]:.3}, error std: {bkt_err_std[ii]:.3} ({bkt_err_std_perc[ii]:.3%})")
-                print(f"PSNR: {b_psnr[ii]}, MSE: {b_mse[ii]}")
-            else:
-                b_psnr[ii] = psnr(buckets_clean, buckets[ii], data_range=(buckets_clean.max() - buckets_clean.min()))
-                b_mse[ii] = mse(buckets_clean - mean_bucket_value, buckets[ii] - mean_bucket_value)
-                print(f"Bucket std: {bkt_cln_std:.3}, error std: {bkt_err_std[ii]:.3} ({bkt_err_std_perc[ii]:.3%})")
-                print(f"PSNR: {b_psnr[ii]}, MSE: {b_mse[ii]}")
-    else:
-        b_psnr[0] = psnr(buckets_clean, buckets, data_range=(buckets_clean.max() - buckets_clean.min()))
-        b_mse[0] = mse(buckets_clean - mean_bucket_value, buckets - mean_bucket_value)
-        print(f"Bucket std: {bkt_cln_std:.3}, error std: {bkt_err_std:.3} ({bkt_err_std_perc:.3%})")
-        print(f"PSNR: {b_psnr}, MSE: {b_mse}")
+    for ii in range(multiplicity):
+        if buckets_clean.ndim > 1:
+            b_psnr[ii] = psnr(buckets_clean[ii], buckets[ii], data_range=(buckets_clean[ii].max() - buckets_clean[ii].min()))
+            b_mse[ii] = mse(buckets_clean[ii] - mean_bucket_value[ii], buckets[ii] - mean_bucket_value[ii])
+            print(f"Bucket std: {bkt_cln_std[ii]:.3}, error std: {bkt_err_std[ii]:.3} ({bkt_err_std_perc[ii]:.3%})")
+            print(f"PSNR: {b_psnr[ii]}, MSE: {b_mse[ii]}")
+        else:
+            b_psnr[ii] = psnr(buckets_clean, buckets[ii], data_range=(buckets_clean.max() - buckets_clean.min()))
+            b_mse[ii] = mse(buckets_clean - mean_bucket_value, buckets[ii] - mean_bucket_value)
+            print(f"Bucket std: {bkt_cln_std:.3}, error std: {bkt_err_std[ii]:.3} ({bkt_err_std_perc[ii]:.3%})")
+            print(f"PSNR: {b_psnr[ii]}, MSE: {b_mse[ii]}")
     if compute_variances:
         variances = cct.processing.noise.compute_variance_poisson(buckets)
         variances /= variances.mean()
@@ -118,12 +107,12 @@ def compute_noise_level(buckets_clean: NDArray, buckets: NDArray, compute_varian
 
 def create_datasets(
     sampling_ratio: float,
-    shape_fov: Optional[Sequence[int]] = None,
+    shape_fov: Sequence[int] | None = None,
     phantom_type: str = "chromosomes",
-    photon_density: Optional[float] = None,
-    readout_noise_std: Optional[float] = None,
+    photon_density: float | None = None,
+    readout_noise_std: float | None = None,
     multiplicity: int = 1,
-    reg_val_tv: Optional[float] = None,
+    reg_val_tv: float | None = None,
     compute_ls: bool = True,
     save: bool = False,
     overwrite: bool = False,
@@ -190,16 +179,16 @@ def create_datasets(
 
     rec_ls = None
     if compute_ls:
-        rec_ls = [get_reconstruction(masks=mc, buckets=bs) for bs in tqdm(buckets, desc="LS reconstructions")]
-        rec_ls = np.stack(rec_ls, axis=0)
+        recs_ls = [reconstruct_variational(masks=mc, buckets=bs) for bs in tqdm(buckets, desc="LS reconstructions")]
+        rec_ls = np.stack([rec for rec, _ in recs_ls], axis=0)
 
     rec_tv = None
     if reg_val_tv is not None:
-        rec_tv = [
-            get_reconstruction(masks=mc, buckets=bs, reg=cct.regularizers.Regularizer_TV2D(reg_val_tv), verbose=True)
+        recs_tv = [
+            reconstruct_variational(masks=mc, buckets=bs, reg=cct.regularizers.Regularizer_TV2D(reg_val_tv), verbose=True)
             for bs in tqdm(buckets, desc="LS-TV reconstructions")
         ]
-        rec_tv = np.stack(rec_tv, axis=0)
+        rec_tv = np.stack([rec for rec, _ in recs_tv], axis=0)
 
     volumes = dict(
         phantom=phantom, foreground=foreground, background=background, reconstruction_ls=rec_ls, reconstruction_tv=rec_tv
@@ -250,3 +239,21 @@ def load_results(info: dict, use_external_gidc: bool = False, use_external_sup: 
         res_recs["gi_sup"] = np.load(results_fpath)["rec"]
 
     return res_recs, {key: results[f"reg_val_{key}"] for key in res_recs.keys() if f"reg_val_{key}" in results}
+
+
+def fit_scales_and_biases(volumes: dict, data: dict) -> dict:
+    mc = cct.struct_illum.MaskCollection(data["masks"])
+    prj = cct.struct_illum.ProjectorGhostImaging(mc)
+
+    data_sb = dict()
+    for key, vol in volumes.items():
+        if key.lower() == "phantom":
+            print(f"Leaving {key} alone")
+            data_sb[key] = vol
+            continue
+
+        scale, bias = cct.processing.post.fit_scale_bias(vol, data["buckets"], prj)
+        print(f"{key}: {scale = }, {bias = }")
+        data_sb[key] = vol * scale + bias
+
+    return data_sb

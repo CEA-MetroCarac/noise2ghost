@@ -1,16 +1,17 @@
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools>=77.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "noise2ghost"
-version = "0.1.0"
+version = "1.0.0"
 description = "Self-supervised deep convolutional reconstructions for ghost imaging."
 authors = [
     {name = "Nicola Vigano", email = "nicola.vigano@cea.fr"},
     {name = "Mathieu Manni", email = "mathieu.manni@esrf.fr"},
 ]
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICEN[CS]E*"]  # , "AUTHORS.md"
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.10"
 keywords = []
@@ -23,6 +24,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Documentation",
     "Topic :: Software Development",
     "Topic :: Utilities",
@@ -35,8 +37,9 @@ dependencies = [
     "matplotlib",
     "scikit-image",
     "h5py",
-    "corrct>=1.0.0rc2",
+    "corrct>=1.0.0",
     "torch",
+    "auto-denoise"
 ]
 
 [project.optional-dependencies]
