@@ -29,12 +29,14 @@ class RecParsCNN:
     """Dataclass for storing reconstruction parameters for a CNN model."""
 
     model: str | Path | Module | NetworkParams = SAVE_MODEL_CNN_PATH
-    num_splits: int = 4
+    num_splits: int | None = 4
     num_perms: int = 6
     lower_limit: float | None = None
     epochs: int = 1024 * 3
     lr: float = 3e-4  # https://x.com/karpathy/status/801621764144971776
     optim_algo: str = "adam"
+    cv_fraction: float = 0.1
+    accum_grads: bool = False
 
 
 def _get_model(model: str | Path | Module | NetworkParams) -> Module:
@@ -110,7 +112,7 @@ def reconstruct_neural_cnn(
     buckets: NDArray,
     rec_pars: RecParsCNN = RecParsCNN(),
     reg_val: float | LossRegularizer | None = None,
-) -> tuple:
+) -> tuple[NDArray, dict[str, NDArray]]:
     """
     Perform neural network-based reconstruction using CNN.
 
@@ -134,17 +136,23 @@ def reconstruct_neural_cnn(
     solver_n2g = N2G(model=model, reg_val=reg_val)
 
     inp_recs_trn, tgt_trn_data, _, tgt_cv_data, tgt_trn_inds = solver_n2g.prepare_data(
-        masks, buckets, num_splits=rec_pars.num_splits, num_perms=rec_pars.num_perms, tst_fraction=0.0, cv_fraction=0.1
+        masks,
+        buckets,
+        num_splits=rec_pars.num_splits,
+        num_perms=rec_pars.num_perms,
+        tst_fraction=0.0,
+        cv_fraction=rec_pars.cv_fraction,
     )
     losses = solver_n2g.train(
         inp_recs_trn,
         tgt_trn_data,
-        tgt_trn_inds,
+        tgt_trn_inds if rec_pars.num_splits is not None else None,
         tgt_cv_data,
         epochs=rec_pars.epochs,
         learning_rate=rec_pars.lr,
         lower_limit=rec_pars.lower_limit,
         algo=rec_pars.optim_algo,
+        accum_grads=rec_pars.accum_grads,
     )
     gi_rec = solver_n2g.infer(inp_recs_trn).mean(axis=0)
 
@@ -232,7 +240,6 @@ def fit_neural_cnn_reg_weight(
     buckets: NDArray,
     rec_pars: RecParsCNN,
     reg_vals: Sequence[float | None] | NDArray | float | None = None,
-    force_gidc: bool = False,
     device: str = "cuda",
 ) -> tuple[float, NDArray, dict[str, NDArray]]:
     """
@@ -248,8 +255,6 @@ def fit_neural_cnn_reg_weight(
         Reconstruction parameters.
     reg_vals : Sequence[float | None] | NDArray | float | None, optional
         Regularization values to test, by default None.
-    force_gidc : bool, optional
-        Whether to force GIDC, by default False.
     device : str, optional
         Device to use for computation, by default "cuda".
 
@@ -258,36 +263,40 @@ def fit_neural_cnn_reg_weight(
     tuple[float, NDArray, dict[str, NDArray]]
         The best regularization weight, the reconstructed image, and training losses.
     """
+    is_n2g = rec_pars.num_splits is not None
+
     model = _get_model(rec_pars.model)
     solver_n2g = N2G(model=model, reg_val=None)
-    if force_gidc:
-        recs_trn_inp, data_trn_tgt, _, data_val_tgt, inds_trn_tgt = solver_n2g.prepare_data(
-            masks, buckets, num_splits=None, tst_fraction=0.0, cv_fraction=0.1
-        )
-        rec_pars = replace(rec_pars, lr=5e-4)
-    else:
-        recs_trn_inp, data_trn_tgt, _, data_val_tgt, inds_trn_tgt = solver_n2g.prepare_data(
-            masks, buckets, num_splits=rec_pars.num_splits, num_perms=rec_pars.num_perms, tst_fraction=0.0, cv_fraction=0.1
-        )
+    recs_trn_inp, data_trn_tgt, _, data_val_tgt, inds_trn_tgt = solver_n2g.prepare_data(
+        masks,
+        buckets,
+        num_splits=rec_pars.num_splits,
+        num_perms=rec_pars.num_perms,
+        tst_fraction=0.0,
+        cv_fraction=rec_pars.cv_fraction,
+    )
     data_sb = deepcopy(solver_n2g.data_sb)
 
     reg_vals = np.array(reg_vals, ndmin=1)
     results = TempResults(recs_in=recs_trn_inp)
 
     for ii_r, reg_val in enumerate(reg_vals):
-        print(f"{ii_r+1}/{len(reg_vals)} Lambda: {reg_val}")
+        print(f"{ii_r+1}/{len(reg_vals)} Lambda: {reg_val:.3e}")
         solver_n2g = N2G(model=deepcopy(model), reg_val=reg_val, data_scale_bias=data_sb, device=device)
         losses = solver_n2g.train(
             recs_trn_inp,
             data_trn_tgt,
-            inds_trn_tgt if not force_gidc else None,
+            inds_trn_tgt if is_n2g else None,
             data_val_tgt,
             epochs=rec_pars.epochs,
             learning_rate=rec_pars.lr,
             algo=rec_pars.optim_algo,
             lower_limit=rec_pars.lower_limit,
+            accum_grads=rec_pars.accum_grads,
         )
-        gi_rec = solver_n2g.infer(recs_trn_inp).mean(axis=0)
+        gi_rec = solver_n2g.infer(recs_trn_inp)
+        if is_n2g:
+            gi_rec = gi_rec.mean(axis=0)
 
         gi_rec = post_process_scale_bias(gi_rec, masks, buckets)
 
@@ -297,24 +306,26 @@ def fit_neural_cnn_reg_weight(
     min_losses = [np.nanmin(losses["loss_tst"]) for losses in results.losses]
     best_rec_ind = np.argmin(min_losses)
 
-    cv = cct.param_tuning.CrossValidation(buckets.shape, verbose=True)
+    cv = cct.param_tuning.CrossValidation(buckets.shape, verbose=True, plot_result=True)
     min_reg_weight, _ = cv.fit_loss_min(reg_vals, np.array(min_losses))
 
     solver_n2g = N2G(model=deepcopy(model), reg_val=min_reg_weight, data_scale_bias=data_sb, device=device)
     losses = solver_n2g.train(
         recs_trn_inp,
         data_trn_tgt,
-        inds_trn_tgt if not force_gidc else None,
+        inds_trn_tgt if is_n2g else None,
         data_val_tgt,
         epochs=rec_pars.epochs,
         learning_rate=rec_pars.lr,
         algo=rec_pars.optim_algo,
         lower_limit=rec_pars.lower_limit,
     )
-    gi_rec = solver_n2g.infer(recs_trn_inp).mean(axis=0)
+    gi_rec = solver_n2g.infer(recs_trn_inp)
+    if is_n2g:
+        gi_rec = gi_rec.mean(axis=0)
 
     gi_rec = post_process_scale_bias(gi_rec, masks, buckets)
-    print(f"{'GIDC' if force_gidc else 'N2G'}: Found lowest loss for lambda = {min_reg_weight} (ind: {best_rec_ind})")
+    print(f"{'N2G' if is_n2g else 'GIDC'}: Found lowest loss for lambda = {min_reg_weight} (ind: {best_rec_ind})")
     return min_reg_weight, gi_rec, losses
 
 
@@ -324,6 +335,7 @@ def fit_neural_inr_reg_weight(
     reg_vals: Sequence[float | None] | NDArray | float | None,
     epochs: int = 1024 * 6,
     device: str = "cuda",
+    lower_limit: float | None = None,
 ) -> tuple[float, NDArray, dict[str, NDArray]]:
     """
     Fit the regularization weight for neural network-based reconstruction using INR.
@@ -348,7 +360,7 @@ def fit_neural_inr_reg_weight(
     """
     if reg_vals is None or isinstance(reg_vals, float):
         reg_vals = [reg_vals]
-    model_def = NetworkParamsINR(n_features=512, n_layers=2, n_embeddings=64)
+    model_def = NetworkParamsINR(n_features=512, n_layers=2, n_embeddings=256)
     solver_inr_base = INR(model=model_def, reg_val=None, device=device)
     encode_grid, data_trn_tgt, _, data_val_tgt = solver_inr_base.prepare_data(
         masks, buckets, tst_fraction=0.0, cv_fraction=0.1
@@ -360,12 +372,19 @@ def fit_neural_inr_reg_weight(
     results = TempResults(recs_in=encode_grid.detach().cpu().numpy().copy())
 
     for ii_r, reg_val in enumerate(reg_vals):
-        print(f"{ii_r+1}/{len(reg_vals)} Lambda: {reg_val}")
+        print(f"{ii_r+1}/{len(reg_vals)} Lambda: {reg_val:.3e}")
         solver_inr = INR(
             model=deepcopy(model), reg_val=reg_val, data_scaling_bias=data_sb, encoder=solver_inr_base.encoder, device=device
         )
         losses = solver_inr.train(
-            encode_grid, data_trn_tgt, data_val_tgt, epochs=epochs, algo="adam", learning_rate=1e-4, weight_decay=0.0
+            encode_grid,
+            data_trn_tgt,
+            data_val_tgt,
+            epochs=epochs,
+            algo="adam",
+            learning_rate=1e-4,
+            weight_decay=0.0,
+            lower_limit=lower_limit,
         )
         gi_rec = solver_inr.infer(encode_grid).mean(axis=0)
 
@@ -377,7 +396,7 @@ def fit_neural_inr_reg_weight(
     min_losses = [np.nanmin(losses["loss_tst"]) for losses in results.losses]
     best_rec_ind = np.argmin(min_losses)
 
-    cv = cct.param_tuning.CrossValidation(buckets.shape, verbose=True)
+    cv = cct.param_tuning.CrossValidation(buckets.shape, verbose=True, plot_result=True)
     min_reg_weight, _ = cv.fit_loss_min(reg_vals, np.array(min_losses))
 
     solver_inr = INR(
