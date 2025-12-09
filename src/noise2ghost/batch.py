@@ -35,6 +35,7 @@ def get_cluster(
     memory: str | None = None,
     walltime: str | None = None,
     job_extra_directives: Sequence[str] | None = None,
+    verbose: bool = False,
 ) -> SpecCluster:
     """Create a cluster object, to be used for distributed computation.
 
@@ -106,10 +107,16 @@ def get_cluster(
                 job_cpu=num_threads,
                 memory=memory,
                 log_directory="tmp",
+                walltime=walltime,
                 job_script_prologue=inherit_config,
                 job_extra_directives=job_extra_directives,
             )
             cluster.scale(jobs=num_workers)
+            if verbose:
+                print(f"Reserved a cluster on queue: {queue}, with walltime: {walltime}")
+                print(f" - N. CPUs x node: {num_threads}, Memory: {memory}")
+                if len(job_extra_directives) > 0:
+                    print(f" - Extra directives: {job_extra_directives}")
 
         case _:
             raise ValueError(f"Unknown cluster queue: {cluster_type}")
