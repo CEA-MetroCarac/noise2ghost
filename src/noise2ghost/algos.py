@@ -310,9 +310,8 @@ class N2G(Denoiser):
         if epochs < 1:
             raise ValueError(f"Number of epochs should be >= 1, but {epochs} was passed")
 
-        losses_trn = []
-        losses_tst = []
-        losses_tst_sbi = []
+        losses = dict(trn=[], tst=[], tst_sbi=[])
+        loss_track_type = "tst"
 
         loss_data_fn = nn.MSELoss(reduction="sum")
         loss_reg_fn = self._get_regularization()
@@ -322,7 +321,7 @@ class N2G(Denoiser):
             lower_limit = lower_limit * self.data_sb.scale_out - self.data_sb.bias_out
 
         best_epoch = -1
-        best_loss_tst = +np.inf
+        best_loss = +np.inf
         best_state = self.model.state_dict()
         best_optim = optim.state_dict()
 
@@ -390,7 +389,7 @@ class N2G(Denoiser):
                 optim.step()
 
             loss_trn_val /= num_inp_recs
-            losses_trn.append(loss_trn_val)
+            losses["trn"].append(loss_trn_val)
 
             # Test
             self.model.eval()
@@ -401,16 +400,16 @@ class N2G(Denoiser):
                 # Compute residual on target
                 tmp_tst_b = _gi_fwd(tgt_tst_m_t, tmp_tst_i.mean(dim=(0, 1)))
 
-                loss_tst = loss_data_fn(tmp_tst_b, tgt_tst_b_t)
-                losses_tst.append(loss_tst.item())
+                loss_tst = loss_data_fn(tmp_tst_b, tgt_tst_b_t) / num_tgt_tst_b
+                losses["tst"].append(loss_tst.item())
 
                 tmp_tst_b_sbi = (tmp_tst_b - tmp_tst_b.mean()) / (tmp_tst_b.std() + 1e-5)
-                loss_tst_sbi = loss_data_fn(tmp_tst_b_sbi, tgt_tst_b_t_sbi)
-                losses_tst_sbi.append(loss_tst_sbi.item())
+                loss_tst_sbi = loss_data_fn(tmp_tst_b_sbi, tgt_tst_b_t_sbi) / num_tgt_tst_b
+                losses["tst_sbi"].append(loss_tst_sbi.item())
 
             # Check improvement
-            if losses_tst[-1] < best_loss_tst if losses_tst[-1] is not None else False:
-                best_loss_tst = losses_tst[-1]
+            if losses[loss_track_type][-1] < best_loss:
+                best_loss = losses[loss_track_type][-1]
                 best_epoch = epoch
                 best_state = cp.deepcopy(self.model.state_dict())
                 best_optim = cp.deepcopy(optim.state_dict())
@@ -426,8 +425,8 @@ class N2G(Denoiser):
                 tmp_trn_b = _gi_fwd(tgt_trn_m_t, tmp_trn_i[..., 0, :, :])
                 # latent_l1_norm = pt.linalg.vector_norm(latent, ord=1) / latent.numel()
                 print(
-                    f"It {epoch}: loss_trn = {loss_trn_val:.5}, loss_tst = {losses_tst[-1]:.5}"
-                    f" (best: {best_loss_tst:.5}, ep: {best_epoch})"
+                    f"It {epoch}: loss_trn = {loss_trn_val:.5}, loss_{loss_track_type} = {losses[loss_track_type][-1]:.5}"
+                    f" (best: {best_loss:.5}, ep: {best_epoch})"
                 )  # , l1 = {latent_l1_norm:.5}
 
                 fig, axs = plt.subplots(1, 4, figsize=[12, 3.25])
@@ -449,11 +448,11 @@ class N2G(Denoiser):
         self.model.load_state_dict(best_state)
 
         if self.verbose:
-            print(f"Best epoch: {best_epoch}, with tst_loss: {best_loss_tst:.5}")
+            print(f"Best epoch: {best_epoch}, with loss_{loss_track_type}: {best_loss:.5}")
         if self.save_epochs_dir is not None:
             self._save_state(epoch_num=best_epoch, optim_state=best_optim, is_best=True)
 
-        losses = dict(loss_trn=np.array(losses_trn), loss_tst=np.array(losses_tst), loss_tst_sbi=np.array(losses_tst_sbi))
+        losses = {f"loss_{loss_type}": np.array(loss_vals) for loss_type, loss_vals in losses.items()}
 
         self._plot_loss_curves(losses, f"Self-supervised {self.__class__.__name__} {algo.upper()}")
 
