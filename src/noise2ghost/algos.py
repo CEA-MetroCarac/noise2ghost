@@ -306,6 +306,7 @@ class N2G(Denoiser):
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-2,
         lower_limit: float | NDArray | None = None,
+        accum_grads: bool = False,
     ) -> dict[str, NDArray]:
         if epochs < 1:
             raise ValueError(f"Number of epochs should be >= 1, but {epochs} was passed")
@@ -342,6 +343,9 @@ class N2G(Denoiser):
         all_num_chunks = _compute_num_chunks(epochs, num_inps=num_inp_recs)
         previous_chunks = all_num_chunks[0] * 2
 
+        num_tgt_trn_b = tgt_trn_b_t.numel()
+        num_tgt_tst_b = tgt_tst_b_t.numel()
+
         for epoch in trange(epochs, desc=f"Training {algo.upper()}", disable=(not self.verbose)):
             # Train
             self.model.train()
@@ -358,37 +362,56 @@ class N2G(Denoiser):
 
                 optim.zero_grad()
 
-                # Compute network's output
-                tmp_trn_i = self.model(inp_trn_r_ep_ch)
-                # Compute residual on target
-                tmp_trn_b = _gi_fwd(tgt_trn_m_t, tmp_trn_i[..., 0, :, :])
+                if accum_grads:
+                    for ii in range(inp_trn_r_ep_ch.shape[0]):
+                        tmp_trn_i = self.model(inp_trn_r_ep_ch[ii : ii + 1 :])
+                        tmp_trn_b = _gi_fwd(tgt_trn_m_t, tmp_trn_i[0, 0, :, :])
 
-                if tgt_trn_inds is not None:
-                    tmp_trn_b = pt.stack(
-                        [tmp_trn_b[ii][inds] for ii, inds in enumerate(tgt_trn_inds[chunk::num_chunks])], dim=0
-                    )
-                    tgt_tmp_b = tgt_trn_b_t[chunk::num_chunks]
+                        if tgt_trn_inds is not None:
+                            tmp_trn_b = tmp_trn_b[tgt_trn_inds[chunk + ii * num_chunks]]
+                            tgt_tmp_b = tgt_trn_b_t[chunk + ii * num_chunks]
+                        else:
+                            tgt_tmp_b = tgt_trn_b_t
+
+                        loss_trn = loss_data_fn(tmp_trn_b, tgt_tmp_b) / num_tgt_trn_b
+                        if loss_reg_fn is not None:
+                            loss_trn += loss_reg_fn(tmp_trn_i)
+                        if lower_limit is not None:
+                            loss_trn += nn.ReLU(inplace=False)(-tmp_trn_i.flatten() + lower_limit).mean()
+
+                        loss_trn.backward()
+                        loss_trn_val += loss_trn.item()
                 else:
-                    tgt_tmp_b = tgt_trn_b_t
+                    # Compute network's output
+                    tmp_trn_i = self.model(inp_trn_r_ep_ch)
+                    # Compute residual on target
+                    tmp_trn_b = _gi_fwd(tgt_trn_m_t, tmp_trn_i[..., 0, :, :])
 
-                if inp_trn_r_t.shape[0] > 1:
-                    tmp_trn_i = pt.concatenate((tmp_trn_i, tmp_trn_i.mean(dim=0, keepdim=True)), dim=0)
+                    if tgt_trn_inds is not None:
+                        tmp_trn_b = pt.stack(
+                            [tmp_trn_b[ii][inds] for ii, inds in enumerate(tgt_trn_inds[chunk::num_chunks])], dim=0
+                        )
+                        tgt_tmp_b = tgt_trn_b_t[chunk::num_chunks]
+                    else:
+                        tgt_tmp_b = tgt_trn_b_t
 
-                loss_trn = loss_data_fn(tmp_trn_b, tgt_tmp_b)
-                if loss_reg_fn is not None:
-                    loss_trn += loss_reg_fn(tmp_trn_i)
-                if lower_limit is not None:
-                    loss_trn += nn.ReLU(inplace=False)(-tmp_trn_i.flatten() + lower_limit).mean()
+                    if inp_trn_r_t.shape[0] > 1:
+                        tmp_trn_i = pt.concatenate((tmp_trn_i, tmp_trn_i.mean(dim=0, keepdim=True)), dim=0)
 
-                loss_trn.backward()
-                loss_trn_val += loss_trn.item()
+                    loss_trn = loss_data_fn(tmp_trn_b, tgt_tmp_b) / num_tgt_trn_b
+                    if loss_reg_fn is not None:
+                        loss_trn += loss_reg_fn(tmp_trn_i)
+                    if lower_limit is not None:
+                        loss_trn += nn.ReLU(inplace=False)(-tmp_trn_i.flatten() + lower_limit).mean()
+
+                    loss_trn.backward()
+                    loss_trn_val += loss_trn.item()
 
                 fix_invalid_gradient_values(self.model)
                 # nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
 
                 optim.step()
 
-            loss_trn_val /= num_inp_recs
             losses["trn"].append(loss_trn_val)
 
             # Test
