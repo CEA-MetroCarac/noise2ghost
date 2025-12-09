@@ -2,7 +2,6 @@
 
 from autoden.models.config import NetworkParams
 from torch.cuda import is_available as is_cuda_available
-from torch.nn import Module
 
 from noise2ghost.models.inr import SIREN
 
