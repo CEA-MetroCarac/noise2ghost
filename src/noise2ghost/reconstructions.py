@@ -11,10 +11,10 @@ from pathlib import Path
 import corrct as cct
 import numpy as np
 from autoden.losses import LossRegularizer
+from autoden.models.io import load_model
 from autoden.models.config import NetworkParams, create_network
 from corrct.struct_illum import MaskCollection
 from numpy.typing import NDArray
-from torch import load as load_model
 from torch.nn import Module
 
 from noise2ghost.algos import INR, N2G, post_process_scale_bias
