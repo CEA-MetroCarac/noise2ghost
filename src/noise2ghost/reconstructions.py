@@ -132,6 +132,8 @@ def reconstruct_neural_cnn(
     tuple
         The reconstructed image and training losses.
     """
+    is_n2g = rec_pars.num_splits is not None
+
     model = _get_model(rec_pars.model)
     solver_n2g = N2G(model=model, reg_val=reg_val)
 
@@ -146,7 +148,7 @@ def reconstruct_neural_cnn(
     losses = solver_n2g.train(
         inp_recs_trn,
         tgt_trn_data,
-        tgt_trn_inds if rec_pars.num_splits is not None else None,
+        tgt_trn_inds if is_n2g else None,
         tgt_cv_data,
         epochs=rec_pars.epochs,
         learning_rate=rec_pars.lr,
@@ -154,7 +156,9 @@ def reconstruct_neural_cnn(
         algo=rec_pars.optim_algo,
         accum_grads=rec_pars.accum_grads,
     )
-    gi_rec = solver_n2g.infer(inp_recs_trn).mean(axis=0)
+    gi_rec = solver_n2g.infer(inp_recs_trn)
+    if is_n2g:
+        gi_rec = gi_rec.mean(axis=0)
 
     gi_rec = post_process_scale_bias(gi_rec, masks, buckets)
 
