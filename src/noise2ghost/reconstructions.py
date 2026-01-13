@@ -13,6 +13,8 @@ import corrct as cct
 from corrct.solvers import SolutionInfo
 import numpy as np
 from autoden.losses import LossRegularizer
+from autoden.algorithms.noise2noise import N2N
+from autoden.algorithms.noise2void import N2V
 from autoden.models.io import load_model
 from autoden.models.config import NetworkParams, create_network
 from corrct.param_tuning import PerfMeterTask, PerfMeterBatch
@@ -114,6 +116,70 @@ def reconstruct_variational(
     c2 = perf_counter()
 
     return rec, info, PerfMeterTask(init_time_s=c1 - c0, exec_time_s=c2 - c1, total_time_s=c2 - c0)
+
+
+def denoise_neural_cnn(
+    masks: NDArray,
+    buckets: NDArray,
+    rec_pars: RecParsCNN = RecParsCNN(),
+    reg_val: float | LossRegularizer | None = None,
+) -> tuple[NDArray, dict[str, NDArray], PerfMeterTask]:
+    """
+    Perform neural network-based denoising of least-squares reconstructions using CNN.
+
+    Parameters
+    ----------
+    masks : NDArray
+        The masks used for reconstruction.
+    buckets : NDArray
+        The bucket data.
+    rec_pars : RecParsCNN, optional
+        Reconstruction parameters, by default RecParsCNN().
+    reg_val : float | LossRegularizer | None, optional
+        Regularization value, by default None.
+
+    Returns
+    -------
+    tuple
+        The reconstructed image, training losses, and performance metrics.
+    """
+    c0 = perf_counter()
+
+    is_n2i = rec_pars.num_splits is not None
+
+    model = _get_model(rec_pars.model)
+    solver_n2g = N2G(model=model, reg_val=reg_val)
+
+    inp_recs_trn, _, _, _, _ = solver_n2g.prepare_data(
+        masks, buckets, num_splits=rec_pars.num_splits, num_perms=1, tst_fraction=0.0, cv_fraction=0.0
+    )
+
+    if is_n2i:
+        denoiser = N2N(model)
+    else:
+        denoiser = N2V(model)
+
+    den_data = denoiser.prepare_data(inp_recs_trn)
+
+    c1 = perf_counter()
+
+    losses = denoiser.train(
+        *den_data,
+        epochs=rec_pars.epochs,
+        learning_rate=rec_pars.lr,
+        lower_limit=rec_pars.lower_limit,
+        optimizer=rec_pars.optim_algo,
+    )
+
+    gi_rec = denoiser.infer(den_data[0])
+    if is_n2i:
+        gi_rec = gi_rec.mean(axis=0)
+
+    gi_rec = post_process_scale_bias(gi_rec, masks, buckets)
+
+    c2 = perf_counter()
+
+    return gi_rec, losses, PerfMeterTask(init_time_s=c1 - c0, exec_time_s=c2 - c1, total_time_s=c2 - c0)
 
 
 def reconstruct_neural_cnn(
