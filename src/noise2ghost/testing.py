@@ -17,6 +17,8 @@ from numpy.typing import DTypeLike, NDArray
 from skimage.metrics import mean_squared_error as mse
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from tqdm.auto import tqdm
+from torchvision.datasets import STL10
+
 
 from noise2ghost.io import DataGI
 from noise2ghost.reconstructions import reconstruct_variational
@@ -28,25 +30,32 @@ def _create_phantom(
     shape_fov: Sequence[int] | None = None, phantom_type: str = "chromosomes", dtype: DTypeLike = np.float32
 ) -> tuple[NDArray, NDArray, NDArray]:
     print(f"Creating a new dataset for {phantom_type = }")
-    if phantom_type.lower() == "dots":
-        shape_fov_tmp = [101, 101]
-        phantom = cct.processing.circular_mask(shape_fov_tmp, radius_offset=-45, vol_origin_zxy=[+30, -30])
-        phantom += cct.processing.circular_mask(shape_fov_tmp, radius_offset=-40, vol_origin_zxy=[+10, 20])
-        phantom += cct.processing.circular_mask(shape_fov_tmp, radius_offset=-30, vol_origin_zxy=[-20, -10])
-    elif phantom_type.lower() == "chromosomes":
-        phantom = skio.imread("data/chromosomes.png")[:, :, :3]
-        phantom = skc.rgb2gray(phantom)
-        one = np.ones(phantom.shape)
-        phantom = one - phantom
-    elif phantom_type.lower() == "ghost":
-        phantom = skio.imread("data/ghost.png")[:, :, :3]
-        phantom = skc.rgb2gray(phantom)
-        one = np.ones(phantom.shape)
-        phantom = one - phantom
-    elif phantom_type.lower() == "shepp-logan":
-        phantom = skd.shepp_logan_phantom()
-    else:
-        raise ValueError(f"No phantom type called: {phantom_type}")
+    match phantom_type.lower().split(":"):
+        case ["dots"]:
+            shape_fov_tmp = [101, 101]
+            phantom = cct.processing.circular_mask(shape_fov_tmp, radius_offset=-45, vol_origin_zxy=[+30, -30])
+            phantom += cct.processing.circular_mask(shape_fov_tmp, radius_offset=-40, vol_origin_zxy=[+10, 20])
+            phantom += cct.processing.circular_mask(shape_fov_tmp, radius_offset=-30, vol_origin_zxy=[-20, -10])
+        case ["chromosomes"]:
+            phantom = skio.imread("data/chromosomes.png")[:, :, :3]
+            phantom = skc.rgb2gray(phantom)
+            one = np.ones(phantom.shape)
+            phantom = one - phantom
+        case ["ghost"]:
+            phantom = skio.imread("data/ghost.png")[:, :, :3]
+            phantom = skc.rgb2gray(phantom)
+            one = np.ones(phantom.shape)
+            phantom = one - phantom
+        case ["toy_xray"]:
+            phantom = skio.imread("data/toy_xray.tif")
+        case ["shepp-logan"]:
+            phantom = skd.shepp_logan_phantom()
+        case "stl-10", img_index:
+            dset = STL10(root="./data/stl10", download=False)
+            phantom = np.squeeze(dset[int(img_index)][0])
+            phantom = skc.rgb2gray(phantom)
+        case _:
+            raise ValueError(f"No phantom type called: {phantom_type}")
 
     if shape_fov is not None:
         phantom = skt.resize(phantom, output_shape=shape_fov, order=1)
@@ -72,8 +81,9 @@ def _generate_data(phantom: NDArray, sampling_ratio: float) -> tuple[cct.struct_
 def _get_dataset_filename(info: dict, extension: str = "h5") -> str:
     ph_dens_str = f"{info['photon_density']:.0g}" if info['photon_density'] is not None else "None"
     multip = f"_multi-{info['multiplicity']}" if 'multiplicity' in info and info['multiplicity'] > 1 else ""
+    phantom_type = info['phantom_type'].replace(":", "-")
     return (
-        f"{info['phantom_type']}_FoV-{'-'.join(str(x) for x in info['shape_fov'])}_sampling-ratio-{info['sampling_ratio']}"
+        f"{phantom_type}_FoV-{'-'.join(str(x) for x in info['shape_fov'])}_sampling-ratio-{info['sampling_ratio']}"
         f"_photon-density-{ph_dens_str}_readout-noise-std-{info['readout_noise_std']}{multip}.{extension}"
     )
 
@@ -116,7 +126,7 @@ def create_datasets(
     compute_ls: bool = True,
     save: bool = False,
     overwrite: bool = False,
-) -> tuple[dict, dict, dict]:
+) -> tuple[dict, dict, dict, dict]:
     print("Creating phantom")
     phantom, foreground, background = _create_phantom(shape_fov, phantom_type=phantom_type)
     if shape_fov is None:
@@ -178,36 +188,50 @@ def create_datasets(
     info["psnr"], info["mse"] = compute_noise_level(buckets_clean, buckets)
 
     rec_ls = None
+    perfs_ls = None
     if compute_ls:
         recs_ls = [reconstruct_variational(masks=mc, buckets=bs) for bs in tqdm(buckets, desc="LS reconstructions")]
-        rec_ls = np.stack([rec for rec, _ in recs_ls], axis=0)
+        rec_ls = np.squeeze(np.stack([rec for rec, _, _ in recs_ls], axis=0))
+        perfs_ls = [p for _, _, p in recs_ls]
 
     rec_tv = None
+    perfs_tv = None
     if reg_val_tv is not None:
         recs_tv = [
             reconstruct_variational(masks=mc, buckets=bs, reg=cct.regularizers.Regularizer_TV2D(reg_val_tv), verbose=True)
             for bs in tqdm(buckets, desc="LS-TV reconstructions")
         ]
-        rec_tv = np.stack([rec for rec, _ in recs_tv], axis=0)
+        rec_tv = np.squeeze(np.stack([rec for rec, _, _ in recs_tv], axis=0))
+        perfs_tv = [p for _, _, p in recs_ls]
 
     volumes = dict(
         phantom=phantom, foreground=foreground, background=background, reconstruction_ls=rec_ls, reconstruction_tv=rec_tv
     )
+    perfs = dict(gi_ls=perfs_ls, gi_tv=perfs_tv)
 
     if save and (overwrite or not dset_fname.exists()):
         dset_fname.parent.mkdir(parents=True, exist_ok=True)
         fid = DataGI(dset_fname)
         fid.save_data(masks=masks, buckets=buckets)
 
-    return info, volumes, dict(masks=masks, buckets=buckets)
+    return info, volumes, dict(masks=masks, buckets=buckets), perfs
 
 
-def save_results(info: dict, recs: dict, reg_vals: dict | None = None, save_old: bool = True) -> None:
+def save_results(
+    info: dict,
+    recs: dict[str, NDArray],
+    reg_vals: dict[str, float | NDArray] | None = None,
+    perfs: dict | None = None,
+    save_old: bool = True,
+    verbose: bool = False,
+) -> None:
     result_dir = DATASETS_DIR / "results_N2G"
     result_dir.mkdir(parents=True, exist_ok=True)
 
     results_fname = result_dir / _get_dataset_filename(info, extension="npz")
     results_fname.expanduser()
+    if verbose:
+        print(f"LOADING: {results_fname}")
 
     if results_fname.exists() and save_old:
         dst = results_fname.with_stem(results_fname.stem + f"_{dt.now().isoformat()}")
@@ -216,17 +240,27 @@ def save_results(info: dict, recs: dict, reg_vals: dict | None = None, save_old:
     results = recs.copy()
     if reg_vals is not None:
         for key, val in reg_vals.items():
-            results[f"reg_val_{key}"] = val
+            if val is not None:
+                results[f"reg_val_{key}"] = np.array(val)
+    if perfs is not None:
+        for key, val in perfs.items():
+            if val is not None:
+                results[f"perfs_{key}"] = val
+
     np.savez_compressed(results_fname, **results)
 
 
-def load_results(info: dict, use_external_gidc: bool = False, use_external_sup: bool = False) -> tuple[dict, dict]:
+def load_results(
+    info: dict, use_external_gidc: bool = False, use_external_sup: bool = False
+) -> tuple[dict[str, NDArray], dict[str, float | NDArray], dict]:
     results_fname = _get_dataset_filename(info, extension="npz")
     results_fpath = DATASETS_DIR / "results_N2G" / results_fname
     results_fpath.expanduser()
 
-    results = dict(**np.load(results_fpath))
-    res_recs = {key: val for key, val in results.items() if "reg_val_" not in key}
+    results = dict(**np.load(results_fpath, allow_pickle=True))
+    res_recs = {key: val for key, val in results.items() if not any(s in key for s in ("reg_val_", "perfs_"))}
+    res_lams = {key: results[f"reg_val_{key}"] for key in res_recs.keys() if f"reg_val_{key}" in results}
+    res_perfs = {key: results[f"perfs_{key}"] for key in res_recs.keys() if f"perfs_{key}" in results}
 
     if use_external_gidc:
         results_fpath = DATASETS_DIR / "results_GIDC" / results_fname
@@ -238,7 +272,7 @@ def load_results(info: dict, use_external_gidc: bool = False, use_external_sup: 
         results_fpath.expanduser()
         res_recs["gi_sup"] = np.load(results_fpath)["rec"]
 
-    return res_recs, {key: results[f"reg_val_{key}"] for key in res_recs.keys() if f"reg_val_{key}" in results}
+    return res_recs, res_lams, res_perfs
 
 
 def fit_scales_and_biases(volumes: dict, data: dict) -> dict:
