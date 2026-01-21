@@ -282,10 +282,10 @@ def fit_variational_reg_weight(
     """
     solver_verbose = not isinstance(parallel_eval, Executor)
 
-    def solve_reg(lam: float, mask: NDArray | None = None) -> tuple[NDArray, SolutionInfo]:
+    def solve_reg(lam: float, b_test_mask: NDArray | None = None) -> tuple[NDArray, SolutionInfo]:
         solver = cct.solvers.PDHG(regularizer=reg(lam), verbose=solver_verbose, leave_progress=False)
         prj = cct.struct_illum.ProjectorGhostImaging(masks)
-        return solver(prj, buckets, iterations=iterations, lower_limit=lower_limit, b_test_mask=mask)
+        return solver(prj, buckets, iterations=iterations, lower_limit=lower_limit, b_test_mask=b_test_mask)
 
     cv = cct.param_tuning.CrossValidation(
         buckets.shape, num_averages=num_averages, verbose=True, plot_result=True, parallel_eval=parallel_eval
