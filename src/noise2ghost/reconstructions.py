@@ -425,7 +425,7 @@ def fit_neural_cnn_reg_weight(
 
     stats_tasks.append(PerfMeterTask(init_time_s=(ct1 - ct0), exec_time_s=(ct2 - ct1), total_time_s=(ct2 - ct0)))
     cb2 = perf_counter()
-    stats_batch = PerfMeterBatch(init_time_s=cb1 - cb0, proc_time_s=cb2 - cb1, total_time_s=cb2 - cb0)
+    stats_batch = PerfMeterBatch(init_time_s=cb1 - cb0, proc_time_s=cb2 - cb1, total_time_s=cb2 - cb0, tasks_perf=stats_tasks)
 
     print(f"{'N2G' if is_n2g else 'GIDC'}: Found lowest loss for lambda = {min_reg_weight} (ind: {best_rec_ind})")
     return min_reg_weight, gi_rec, losses, stats_batch
@@ -529,7 +529,7 @@ def fit_neural_inr_reg_weight(
 
     stats_tasks.append(PerfMeterTask(init_time_s=(ct1 - ct0), exec_time_s=(ct2 - ct1), total_time_s=(ct2 - ct0)))
     cb2 = perf_counter()
-    stats_batch = PerfMeterBatch(init_time_s=cb1 - cb0, proc_time_s=cb2 - cb1, total_time_s=cb2 - cb0)
+    stats_batch = PerfMeterBatch(init_time_s=cb1 - cb0, proc_time_s=cb2 - cb1, total_time_s=cb2 - cb0, tasks_perf=stats_tasks)
 
     print(f"INR: Found lowest loss for lambda = {min_reg_weight} (ind: {best_rec_ind})")
     return min_reg_weight, gi_rec, losses, stats_batch
