@@ -145,21 +145,19 @@ def denoise_neural_cnn(
     """
     c0 = perf_counter()
 
-    is_n2i = rec_pars.num_splits is not None
-
-    model = _get_model(rec_pars.model)
-    solver_n2g = N2G(model=model, reg_val=reg_val)
+    model = deepcopy(_get_model(rec_pars.model))
+    solver_n2g = N2G(model=model)
 
     inp_recs_trn, _, _, _, _ = solver_n2g.prepare_data(
         masks, buckets, num_splits=rec_pars.num_splits, num_perms=1, tst_fraction=0.0, cv_fraction=0.0
     )
 
-    if is_n2i:
-        denoiser = N2N(model)
+    if rec_pars.num_splits is not None:
+        denoiser = N2N(model, reg_val=reg_val)
     else:
-        denoiser = N2V(model)
+        denoiser = N2V(model, reg_val=reg_val)
 
-    den_data = denoiser.prepare_data(inp_recs_trn)
+    den_data = denoiser.prepare_data(np.squeeze(inp_recs_trn))
 
     c1 = perf_counter()
 
@@ -172,8 +170,6 @@ def denoise_neural_cnn(
     )
 
     gi_rec = denoiser.infer(den_data[0])
-    if is_n2i:
-        gi_rec = gi_rec.mean(axis=0)
 
     gi_rec = post_process_scale_bias(gi_rec, masks, buckets)
 
