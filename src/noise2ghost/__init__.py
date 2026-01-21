@@ -15,5 +15,6 @@ from . import algos
 from . import models
 from . import reconstructions
 from . import testing
+from . import io
 
 # __all__: list[str] = []
