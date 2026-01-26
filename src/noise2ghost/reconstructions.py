@@ -42,6 +42,7 @@ class RecParsCNN:
     optim_algo: str = "adam"
     cv_fraction: float = 0.1
     accum_grads: bool = False
+    rng_seed: int | None = None
 
 
 def _get_model(model: str | Path | Module | NetworkParams) -> Module:
@@ -229,6 +230,7 @@ def reconstruct_neural_cnn(
         num_perms=rec_pars.num_perms,
         tst_fraction=0.0,
         cv_fraction=rec_pars.cv_fraction,
+        rng_seed=rec_pars.rng_seed,
     )
 
     c1 = perf_counter()

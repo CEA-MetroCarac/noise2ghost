@@ -42,6 +42,7 @@ def split_realizations(
     tst_fraction: float = 0.1,
     cv_fraction: float = 0.1,
     pre_permute: bool = True,
+    rng_seed: int | None = None,
 ) -> Sequence[tuple[NDArray, NDArray]]:
     """Partition the set of realizations in multiple sub-sets.
 
@@ -59,12 +60,15 @@ def split_realizations(
         Fraction of the realizations in the test set, by default 0.1
     cv_fraction : float, optional
         Fraction of the realizations in the cross-validation, by default 0.1
+    rng_seed : int | None, optional
+        Random generation seed, by default None
 
     Returns
     -------
     Sequence[tuple[NDArray, NDArray]]
         The list of partitions
     """
+    rng = np.random.default_rng(rng_seed)
     tot_realizations = len(buckets)
     print(f"Total number of realizations: {tot_realizations}, split as:")
 
@@ -89,7 +93,7 @@ def split_realizations(
     masks_flat = masks.reshape([-1, *masks.shape[-2:]])
     # Think of randomizing masks and buckets, in order to avoid bias towards last realizations
     if pre_permute:
-        rnd_perm = np.random.permutation(tot_realizations)
+        rnd_perm = rng.permutation(tot_realizations)
         masks_flat = masks_flat[rnd_perm]
         buckets = buckets[rnd_perm]
 
@@ -107,7 +111,7 @@ def split_realizations(
 
     if num_splits is not None:
         for _ in trange(num_perms, desc="Computing permutation tuples"):
-            rnd_perm = np.random.permutation(trn_size)
+            rnd_perm = rng.permutation(trn_size)
 
             for s in slices_trn:
                 inds_inp_s = np.zeros(len(rnd_perm), dtype=bool)
@@ -246,6 +250,7 @@ class N2G(Denoiser):
         tst_fraction: float = 0.1,
         cv_fraction: float = 0.1,
         force_scaling: bool = True,
+        rng_seed: int | None = None,
     ) -> tuple[NDArray, tuple[NDArray, NDArray], tuple[NDArray, NDArray], tuple[NDArray, NDArray], NDArray]:
         adjust_scaling = False
 
@@ -276,6 +281,7 @@ class N2G(Denoiser):
             num_perms=num_perms,
             tst_fraction=tst_fraction,
             cv_fraction=cv_fraction,
+            rng_seed=rng_seed,
         )
         data_trn_m = data_trn_tgt[0]
         data_trn_b = data_trn_tgt[1]
