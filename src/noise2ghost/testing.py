@@ -242,7 +242,7 @@ def save_results(
     results_fname = result_dir / _get_dataset_filename(info, extension="npz")
     results_fname.expanduser()
     if verbose:
-        print(f"LOADING: {results_fname}")
+        print(f"STORING: {results_fname}")
 
     if results_fname.exists() and save_old:
         dst = results_fname.with_stem(results_fname.stem + f"_{dt.now().isoformat()}")
@@ -262,11 +262,13 @@ def save_results(
 
 
 def load_results(
-    info: dict, use_external_gidc: bool = False, use_external_sup: bool = False
+    info: dict, use_external_gidc: bool = False, use_external_sup: bool = False, verbose: bool = False
 ) -> tuple[dict[str, NDArray], dict[str, float | NDArray], dict]:
     results_fname = _get_dataset_filename(info, extension="npz")
     results_fpath = DATASETS_DIR / "results_N2G" / results_fname
     results_fpath.expanduser()
+    if verbose:
+        print(f"LOADING: {results_fpath}")
 
     results = dict(**np.load(results_fpath, allow_pickle=True))
     res_recs = {key: val for key, val in results.items() if not any(s in key for s in ("reg_val_", "perfs_"))}
