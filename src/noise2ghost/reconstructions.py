@@ -22,7 +22,7 @@ from corrct.struct_illum import MaskCollection, ProjectorGhostImaging
 from numpy.typing import NDArray
 from torch.nn import Module
 
-from noise2ghost.algos import INR, N2G, post_process_scale_bias
+from noise2ghost.algos import INR, N2G, post_process_scale_bias, DataScaleBias
 from noise2ghost.models.config import NetworkParamsINR
 from noise2ghost.models.inr import SIREN
 
@@ -34,6 +34,7 @@ class RecParsCNN:
     """Dataclass for storing reconstruction parameters for a CNN model."""
 
     model: str | Path | Module | NetworkParams = SAVE_MODEL_CNN_PATH
+    data_sb: DataScaleBias | None = None
     num_splits: int | None = 4
     num_perms: int = 6
     lower_limit: float | None = None
@@ -41,6 +42,7 @@ class RecParsCNN:
     lr: float = 3e-4  # https://x.com/karpathy/status/801621764144971776
     optim_algo: str = "adam"
     cv_fraction: float = 0.1
+    num_averages: int = 1
     accum_grads: bool = False
     rng_seed: int | None = None
 
@@ -159,7 +161,7 @@ def denoise_neural_cnn(
     c0 = perf_counter()
 
     model = deepcopy(_get_model(rec_pars.model))
-    solver_n2g = N2G(model=model)
+    solver_n2g = N2G(model=model, data_scale_bias=rec_pars.data_sb)
 
     inp_recs_trn, _, _, _, _ = solver_n2g.prepare_data(
         masks, buckets, num_splits=rec_pars.num_splits, num_perms=1, tst_fraction=0.0, cv_fraction=0.0
@@ -196,6 +198,7 @@ def reconstruct_neural_cnn(
     buckets: NDArray,
     rec_pars: RecParsCNN = RecParsCNN(),
     reg_val: float | LossRegularizer | None = None,
+    device: str = "cuda",
 ) -> tuple[NDArray, dict[str, NDArray], PerfMeterTask]:
     """
     Perform neural network-based reconstruction using CNN.
@@ -210,6 +213,8 @@ def reconstruct_neural_cnn(
         Reconstruction parameters, by default RecParsCNN().
     reg_val : float | LossRegularizer | None, optional
         Regularization value, by default None.
+    device : str, optional
+        Device to use for computation, by default "cuda".
 
     Returns
     -------
@@ -221,7 +226,7 @@ def reconstruct_neural_cnn(
     is_n2g = rec_pars.num_splits is not None
 
     model = _get_model(rec_pars.model)
-    solver_n2g = N2G(model=model, reg_val=reg_val)
+    solver_n2g = N2G(model=model, data_scale_bias=rec_pars.data_sb, reg_val=reg_val, device=device)
 
     inp_recs_trn, tgt_trn_data, _, tgt_cv_data, tgt_trn_inds = solver_n2g.prepare_data(
         masks,
@@ -372,79 +377,77 @@ def fit_neural_cnn_reg_weight(
     is_n2g = rec_pars.num_splits is not None
 
     model = _get_model(rec_pars.model)
-    solver_n2g = N2G(model=model, reg_val=None)
-    recs_trn_inp, data_trn_tgt, _, data_val_tgt, inds_trn_tgt = solver_n2g.prepare_data(
-        masks,
-        buckets,
-        num_splits=rec_pars.num_splits,
-        num_perms=rec_pars.num_perms,
-        tst_fraction=0.0,
-        cv_fraction=rec_pars.cv_fraction,
-    )
-    data_sb = deepcopy(solver_n2g.data_sb)
 
     reg_vals = np.array(reg_vals, ndmin=1)
-    results = TempResults(recs_in=recs_trn_inp)
-    stats_tasks = []
+    stats_tasks: list[PerfMeterTask] = []
+    all_results: list[TempResults] = []
+    min_losses = np.zeros((rec_pars.num_averages, len(reg_vals)), dtype=np.float32)
 
-    cb1 = perf_counter()
+    cb_i = perf_counter() - cb0
 
-    for ii_r, reg_val in enumerate(reg_vals):
-        print(f"{ii_r+1}/{len(reg_vals)} Lambda: {reg_val:.3e}")
-        ct0 = perf_counter()
-        solver_n2g = N2G(model=deepcopy(model), reg_val=reg_val, data_scale_bias=data_sb, device=device)
-        ct1 = perf_counter()
-        losses = solver_n2g.train(
-            recs_trn_inp,
-            data_trn_tgt,
-            inds_trn_tgt if is_n2g else None,
-            data_val_tgt,
-            epochs=rec_pars.epochs,
-            learning_rate=rec_pars.lr,
-            algo=rec_pars.optim_algo,
-            lower_limit=rec_pars.lower_limit,
-            accum_grads=rec_pars.accum_grads,
+    for ii_a in range(rec_pars.num_averages):
+        cba0 = perf_counter()
+
+        solver_n2g = N2G(model=model, reg_val=None, data_scale_bias=rec_pars.data_sb)
+        recs_trn_inp, data_trn_tgt, _, data_val_tgt, inds_trn_tgt = solver_n2g.prepare_data(
+            masks,
+            buckets,
+            num_splits=rec_pars.num_splits,
+            num_perms=rec_pars.num_perms,
+            tst_fraction=0.0,
+            cv_fraction=rec_pars.cv_fraction,
         )
-        gi_rec = solver_n2g.infer(recs_trn_inp)
-        if is_n2g:
-            gi_rec = gi_rec.mean(axis=0)
+        data_sb = deepcopy(solver_n2g.data_sb)
 
-        gi_rec = post_process_scale_bias(gi_rec, masks, buckets)
-        ct2 = perf_counter()
+        results = TempResults(recs_in=recs_trn_inp)
 
-        results.recs_out.append(gi_rec)
-        results.losses.append(losses)
-        stats_tasks.append(PerfMeterTask(init_time_s=(ct1 - ct0), exec_time_s=(ct2 - ct1), total_time_s=(ct2 - ct0)))
+        cb_i += perf_counter() - cba0
 
-    min_losses = [np.nanmin(losses["loss_tst"]) for losses in results.losses]
-    best_rec_ind = np.argmin(min_losses)
+        for ii_r, reg_val in enumerate(reg_vals):
+            print(f"{ii_r+1}/{len(reg_vals)} Lambda: {reg_val:.3e}")
+            ct0 = perf_counter()
+            solver_n2g = N2G(model=deepcopy(model), reg_val=reg_val, data_scale_bias=data_sb, device=device)
+            ct1 = perf_counter()
+            losses = solver_n2g.train(
+                recs_trn_inp,
+                data_trn_tgt,
+                inds_trn_tgt if is_n2g else None,
+                data_val_tgt,
+                epochs=rec_pars.epochs,
+                learning_rate=rec_pars.lr,
+                algo=rec_pars.optim_algo,
+                lower_limit=rec_pars.lower_limit,
+                accum_grads=rec_pars.accum_grads,
+            )
+            gi_rec = solver_n2g.infer(recs_trn_inp)
+            if is_n2g:
+                gi_rec = gi_rec.mean(axis=0)
 
-    cv = cct.param_tuning.CrossValidation(buckets.shape, verbose=True, plot_result=True)
-    min_reg_weight, _ = cv.fit_loss_min(reg_vals, np.array(min_losses))
+            gi_rec = post_process_scale_bias(gi_rec, masks, buckets)
+            ct2 = perf_counter()
 
-    ct0 = perf_counter()
-    solver_n2g = N2G(model=deepcopy(model), reg_val=min_reg_weight, data_scale_bias=data_sb, device=device)
-    ct1 = perf_counter()
-    losses = solver_n2g.train(
-        recs_trn_inp,
-        data_trn_tgt,
-        inds_trn_tgt if is_n2g else None,
-        data_val_tgt,
-        epochs=rec_pars.epochs,
-        learning_rate=rec_pars.lr,
-        algo=rec_pars.optim_algo,
-        lower_limit=rec_pars.lower_limit,
+            results.recs_out.append(gi_rec)
+            results.losses.append(losses)
+            stats_tasks.append(PerfMeterTask(init_time_s=(ct1 - ct0), exec_time_s=(ct2 - ct1), total_time_s=(ct2 - ct0)))
+
+        all_results.append(results)
+        min_losses[ii_a, ...] = [np.nanmin(losses["loss_tst"]) for losses in results.losses]
+
+    min_losses_avg = min_losses.mean(axis=0)
+    min_losses_std = min_losses.std(axis=0)
+    best_rec_ind = np.argmin(min_losses_avg)
+
+    min_reg_weight, _ = cct.param_tuning.fit_func_min(
+        reg_vals, f_vals=min_losses_avg, f_stds=min_losses_std, verbose=True, plot_result=True
     )
-    gi_rec = solver_n2g.infer(recs_trn_inp)
-    if is_n2g:
-        gi_rec = gi_rec.mean(axis=0)
 
-    gi_rec = post_process_scale_bias(gi_rec, masks, buckets)
-    ct2 = perf_counter()
+    gi_rec, losses, rec_perf = reconstruct_neural_cnn(masks, buckets, rec_pars=rec_pars, reg_val=min_reg_weight, device=device)
+    stats_tasks.append(rec_perf)
 
-    stats_tasks.append(PerfMeterTask(init_time_s=(ct1 - ct0), exec_time_s=(ct2 - ct1), total_time_s=(ct2 - ct0)))
     cb2 = perf_counter()
-    stats_batch = PerfMeterBatch(init_time_s=cb1 - cb0, proc_time_s=cb2 - cb1, total_time_s=cb2 - cb0, tasks_perf=stats_tasks)
+    cb_i += rec_perf.init_time_s
+    cb_p = sum([rp.exec_time_s for rp in stats_tasks])
+    stats_batch = PerfMeterBatch(init_time_s=cb_i, proc_time_s=cb_p, total_time_s=cb2 - cb0, tasks_perf=stats_tasks)
 
     print(f"{'N2G' if is_n2g else 'GIDC'}: Found lowest loss for lambda = {min_reg_weight} (ind: {best_rec_ind})")
     return min_reg_weight, gi_rec, losses, stats_batch
