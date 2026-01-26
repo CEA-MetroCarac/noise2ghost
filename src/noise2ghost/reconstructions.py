@@ -492,7 +492,7 @@ def fit_neural_inr_reg_weight(
     model: SIREN = solver_inr_base.model
 
     reg_vals = np.array(reg_vals, ndmin=1)
-    results = TempResults(recs_in=encode_grid.detach().cpu().numpy().copy())
+    results = TempResults(recs_in=encode_grid.detach().to("cpu").numpy().copy())
     stats_tasks = []
 
     cb1 = perf_counter()
@@ -523,11 +523,12 @@ def fit_neural_inr_reg_weight(
         results.losses.append(losses)
         stats_tasks.append(PerfMeterTask(init_time_s=(ct1 - ct0), exec_time_s=(ct2 - ct1), total_time_s=(ct2 - ct0)))
 
-    min_losses = [np.nanmin(losses["loss_tst"]) for losses in results.losses]
+    min_losses = np.array([np.nanmin(losses["loss_tst"]) for losses in results.losses])
     best_rec_ind = np.argmin(min_losses)
 
-    cv = cct.param_tuning.CrossValidation(buckets.shape, verbose=True, plot_result=True)
-    min_reg_weight, _ = cv.fit_loss_min(reg_vals, np.array(min_losses))
+    min_reg_weight, _ = cct.param_tuning.fit_func_min(
+        reg_vals, f_vals=min_losses, f_stds=min_losses, verbose=True, plot_result=True
+    )
 
     ct0 = perf_counter()
     solver_inr = INR(
