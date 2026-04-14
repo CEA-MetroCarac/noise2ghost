@@ -2,8 +2,8 @@
 
 import copy as cp
 from collections.abc import Sequence
+from typing import Callable
 
-import corrct as cct
 import matplotlib.pyplot as plt
 import numpy as np
 import torch as pt
@@ -11,6 +11,8 @@ import torch.nn as nn
 from autoden.algorithms.denoiser import DataScaleBias, Denoiser, get_normalization_range
 from autoden.models.config import create_optimizer
 from autoden.models.param_utils import fix_invalid_gradient_values, get_num_parameters
+from corrct.struct_illum import MaskCollection, ProjectorGhostImaging
+from corrct.processing.post import fit_scale_bias
 from numpy.typing import NDArray
 from tqdm.auto import trange
 
@@ -133,9 +135,9 @@ def split_realizations(
     return data_split_inds, data_trn, data_tst, data_cv
 
 
-def _gi_fwd(masks: pt.Tensor, image: pt.Tensor) -> pt.Tensor:
-    new_masks_shape = [*masks.shape[:-2], int(np.prod(np.array(masks.shape[-2:])))]
-    new_image_shape = [*image.shape[:-2], int(np.prod(np.array(image.shape[-2:]))), 1]
+def _gi_fwd(masks: pt.Tensor, image: pt.Tensor, n_dims: int = 2) -> pt.Tensor:
+    new_masks_shape = [*masks.shape[:-n_dims], int(np.prod(np.array(masks.shape[-n_dims:])))]
+    new_image_shape = [*image.shape[:-n_dims], int(np.prod(np.array(image.shape[-n_dims:]))), 1]
     masks = masks.reshape(new_masks_shape)
     image = image.reshape(new_image_shape)
 
@@ -144,7 +146,11 @@ def _gi_fwd(masks: pt.Tensor, image: pt.Tensor) -> pt.Tensor:
 
 
 def compute_scaling_ghost_imaging(
-    masks: NDArray, buckets: NDArray, adjust_scaling: bool = False, verbose: bool = True
+    masks: NDArray,
+    buckets: NDArray,
+    adjust_scaling: bool = False,
+    verbose: bool = True,
+    projector_cls: Callable[[MaskCollection], ProjectorGhostImaging] = ProjectorGhostImaging,
 ) -> DataScaleBias:
     """
     Compute input, output, and target data scaling and bias for the ghost imaging reconstruction.
@@ -169,8 +175,8 @@ def compute_scaling_ghost_imaging(
     """
     data_sb = DataScaleBias()
     print("Computing least-squares reconstruction for normalization:")
-    mc = cct.struct_illum.MaskCollection(masks)
-    p = cct.struct_illum.ProjectorGhostImaging(mc)
+    mc = MaskCollection(masks)
+    p = projector_cls(mc)
     rec_ls = p.fbp(buckets, adjust_scaling=adjust_scaling)
 
     stats_det = get_normalization_range(buckets, percentile=0.01)
@@ -185,8 +191,8 @@ def compute_scaling_ghost_imaging(
 
     masks = masks / data_scaling_recs
 
-    mc = cct.struct_illum.MaskCollection(masks)
-    p = cct.struct_illum.ProjectorGhostImaging(mc)
+    mc = MaskCollection(masks)
+    p = projector_cls(mc)
 
     data_bias_tgt = p(np.ones_like(rec_ls) * data_bias_recs)
     buckets = buckets - data_bias_tgt
@@ -223,8 +229,8 @@ def compute_scaling_ghost_imaging(
     buckets = buckets * data_scaling_tgt
     masks = masks * data_scaling_tgt
 
-    mc = cct.struct_illum.MaskCollection(masks)
-    p = cct.struct_illum.ProjectorGhostImaging(mc)
+    mc = MaskCollection(masks)
+    p = projector_cls(mc)
 
     rec_ls = p.fbp(buckets, adjust_scaling=adjust_scaling)
 
@@ -263,8 +269,8 @@ class N2G(Denoiser):
         inp_masks = inp_masks * self.data_sb.scale_tgt / self.data_sb.scale_out
 
         if self.verbose and not (self.data_sb is None or force_scaling):
-            mc = cct.struct_illum.MaskCollection(inp_masks)
-            p = cct.struct_illum.ProjectorGhostImaging(mc)
+            mc = MaskCollection(inp_masks)
+            p = ProjectorGhostImaging(mc)
 
             rec_ls = p.fbp(inp_buckets, adjust_scaling=adjust_scaling)
 
@@ -292,8 +298,8 @@ class N2G(Denoiser):
         for ii in trange(len(inds_trn_inp), desc="Computing reconstructions", disable=(not self.verbose)):
             ms = data_trn_m[inds_trn_inp[ii]]
             bs = data_trn_b[inds_trn_inp[ii]]
-            mc = cct.struct_illum.MaskCollection(ms)
-            p = cct.struct_illum.ProjectorGhostImaging(mc)
+            mc = MaskCollection(ms)
+            p = ProjectorGhostImaging(mc)
 
             rec_ls = p.fbp(bs, adjust_scaling=adjust_scaling)
             recs_inp.append(rec_ls)
@@ -313,12 +319,12 @@ class N2G(Denoiser):
         weight_decay: float = 1e-2,
         lower_limit: float | NDArray | None = None,
         accum_grads: bool = False,
+        loss_track_type: str = "tst",
     ) -> dict[str, NDArray]:
         if epochs < 1:
             raise ValueError(f"Number of epochs should be >= 1, but {epochs} was passed")
 
         losses = dict(trn=[], tst=[], tst_sbi=[])
-        loss_track_type = "tst"
 
         loss_data_fn = nn.MSELoss(reduction="sum")
         loss_reg_fn = self._get_regularization()
@@ -497,6 +503,7 @@ class INR(Denoiser):
     def __init__(
         self,
         model: NetworkParamsINR | SIREN,
+        ndims: int = 2,
         data_scaling_bias: DataScaleBias | None = None,
         encoder: PositionalEncoder | None = None,
         reg_val: float | None = 1e-5,
@@ -541,8 +548,10 @@ class INR(Denoiser):
         if verbose:
             get_num_parameters(self.model, verbose=True)
 
+        self.ndims = ndims
+
         if encoder is None:
-            encoder = PositionalEncoder(num_embeddings=self.model.n_embeddings, ndims=self.model.n_channels_in, device=device)
+            encoder = PositionalEncoder(num_embeddings=self.model.n_embeddings, ndims=ndims, device=device)
         self.encoder = encoder
 
         self.data_sb = data_scaling_bias
@@ -551,6 +560,10 @@ class INR(Denoiser):
         self.device = device
         self.save_epochs_dir = save_epochs_dir
         self.verbose = verbose
+
+    @property
+    def n_dims(self) -> int:
+        return self.ndims
 
     def prepare_data(
         self,
@@ -606,8 +619,8 @@ class INR(Denoiser):
         inp_masks = inp_masks * self.data_sb.scale_tgt / self.data_sb.scale_out
 
         if self.verbose and not (self.data_sb is None or force_scaling):
-            mc = cct.struct_illum.MaskCollection(inp_masks)
-            p = cct.struct_illum.ProjectorGhostImaging(mc)
+            mc = MaskCollection(inp_masks)
+            p = ProjectorGhostImaging(mc)
 
             rec_ls = p.fbp(inp_buckets, adjust_scaling=adjust_scaling)
 
@@ -617,7 +630,11 @@ class INR(Denoiser):
             print(f"- buckets: range [{stats_det[0]:.3}, {stats_det[1]:.3}], mean {stats_det[2]:.3}")
             print(f"- reconstruction: range [{stats_rec[0]:.3}, {stats_rec[1]:.3}], mean {stats_rec[2]:.3}")
 
-        grid = self.encoder.create_grid(inp_masks.shape[-2:])
+        rec_dims = list(inp_masks.shape[-2:])
+        if self.n_dims == 3:
+            rec_dims.append(inp_masks.shape[-1])
+
+        grid = self.encoder.create_grid(rec_dims)
         print(f'grid shape: {grid.shape}')
         encode_grid = self.encoder.embed(grid)
         print(f'encode_grid shape: {encode_grid.shape}')
@@ -749,14 +766,11 @@ class INR(Denoiser):
             if lower_limit is not None:
                 loss_trn += nn.ReLU(inplace=False)(-tmp_trn_i.flatten() + lower_limit).mean()
 
+            losses_trn.append(loss_trn.item())
+
             loss_trn.backward()
-            loss_trn_val = loss_trn.item()
-
             fix_invalid_gradient_values(self.model)
-
             optim.step()
-
-            losses_trn.append(loss_trn_val)
 
             # Test
             self.model.eval()
@@ -768,9 +782,7 @@ class INR(Denoiser):
                 # Compute residual on target
                 tmp_tst_b = _gi_fwd(tgt_tst_m_t, tmp_tst_i.mean(dim=(0, 1)))
                 loss_tst = loss_data_fn(tmp_tst_b, tgt_tst_b_t)
-
-                loss_tst_val = loss_tst.item()
-                losses_tst.append(loss_tst_val)
+                losses_tst.append(loss_tst.item())
 
                 tmp_tst_b_sbi = (tmp_tst_b - tmp_tst_b.mean()) / (tmp_tst_b.std() + 1e-5)
                 loss_tst_sbi = loss_data_fn(tmp_tst_b_sbi, tgt_tst_b_t_sbi)
@@ -795,7 +807,7 @@ class INR(Denoiser):
                 tmp_trn_b = _gi_fwd(tgt_trn_m_t, tmp_trn_i.mean(dim=(0, 1)))
                 # latent_l1_norm = pt.linalg.vector_norm(latent, ord=1) / latent.numel()
                 print(
-                    f"It {epoch}: loss_trn = {loss_trn_val:.5}, loss_tst = {loss_tst_val:.5}"
+                    f"It {epoch}: loss_trn = {losses_trn[-1]:.5}, loss_tst = {losses_tst[-1]:.5}"
                     f" (best: {best_loss_tst:.5}, ep: {best_epoch})"
                 )  # , l1 = {latent_l1_norm:.5}
 
@@ -854,7 +866,7 @@ class INR(Denoiser):
 
 def post_process_scale_bias(
     out_rec: NDArray,
-    inp_masks: NDArray | cct.struct_illum.MaskCollection | cct.struct_illum.ProjectorGhostImaging,
+    inp_masks: NDArray | MaskCollection | ProjectorGhostImaging,
     inp_buckets: NDArray,
     verbose: bool = False,
 ) -> NDArray:
@@ -865,7 +877,7 @@ def post_process_scale_bias(
     ----------
     out_rec : NDArray
         The reconstructed image to be post-processed.
-    inp_masks : NDArray | cct.struct_illum.MaskCollection | cct.struct_illum.ProjectorGhostImaging,
+    inp_masks : NDArray | MaskCollection | ProjectorGhostImaging,
         The input masks or projector used for the reconstruction.
     inp_buckets : NDArray
         The input buckets used for the reconstruction.
@@ -882,12 +894,12 @@ def post_process_scale_bias(
     This function takes a reconstructed image and applies a scale and bias to it based on the input masks and buckets.
     The scale and bias are fitted using the `fit_scale_bias` function from the `cct.processing.post` module.
     """
-    if isinstance(inp_masks, cct.struct_illum.ProjectorGhostImaging):
+    if isinstance(inp_masks, ProjectorGhostImaging):
         prj = inp_masks
     else:
-        prj = cct.struct_illum.ProjectorGhostImaging(inp_masks)
+        prj = ProjectorGhostImaging(inp_masks)
 
-    scale, bias = cct.processing.post.fit_scale_bias(out_rec, inp_buckets, prj)
+    scale, bias = fit_scale_bias(out_rec, inp_buckets, prj)
     if verbose:
         print(f"Fitted: {scale = }, {bias = }")
     return out_rec * scale + bias
