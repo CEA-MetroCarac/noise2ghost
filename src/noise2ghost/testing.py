@@ -6,6 +6,7 @@ import shutil
 from collections.abc import Sequence
 from datetime import datetime as dt
 from pathlib import Path
+from warnings import warn
 
 import corrct as cct
 import numpy as np
@@ -17,7 +18,14 @@ from numpy.typing import DTypeLike, NDArray
 from skimage.metrics import mean_squared_error as mse
 from skimage.metrics import peak_signal_noise_ratio as psnr
 from tqdm.auto import tqdm
-from torchvision.datasets import STL10
+
+try:
+    from torchvision.datasets import STL10
+
+    __has_torchvision__ = True
+except ImportError:
+    warn("You'll need `torchvision` to use the STL10 dataset.")
+    __has_torchvision__ = False
 
 
 from noise2ghost.io import DataGI
@@ -51,6 +59,9 @@ def _create_phantom(
         case ["shepp-logan"]:
             phantom = skd.shepp_logan_phantom()
         case "stl-10", img_index:
+            if not __has_torchvision__:
+                raise ValueError("You'll need `torchvision` to use the STL10 dataset.")
+
             dset = STL10(root="./data/stl10", download=False)
             phantom = np.squeeze(dset[int(img_index)][0])
             phantom = skc.rgb2gray(phantom)
