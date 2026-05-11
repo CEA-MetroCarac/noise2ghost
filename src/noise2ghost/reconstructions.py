@@ -18,7 +18,7 @@ from autoden.algorithms.noise2void import N2V
 from autoden.models.io import load_model
 from autoden.models.config import NetworkParams, create_network
 from corrct.param_tuning import PerfMeterTask, PerfMeterBatch
-from corrct.struct_illum import MaskCollection
+from corrct.struct_illum import MaskCollection, ProjectorGhostImaging
 from numpy.typing import NDArray
 from torch.nn import Module
 
@@ -67,19 +67,30 @@ def _get_model(model: str | Path | Module | NetworkParams) -> Module:
         return deepcopy(model)
 
 
+def _get_projector(masks_or_proj: NDArray | MaskCollection | ProjectorGhostImaging) -> ProjectorGhostImaging:
+    if isinstance(masks_or_proj, ProjectorGhostImaging):
+        prj = masks_or_proj
+    elif isinstance(masks_or_proj, (MaskCollection, NDArray)):
+        prj = cct.struct_illum.ProjectorGhostImaging(masks_or_proj)
+    else:
+        raise ValueError("You should provide one of [NDArray | MaskCollection | ProjectorGhostImaging]")
+    return prj
+
+
 def reconstruct_variational(
-    masks: NDArray | MaskCollection,
+    masks: NDArray | MaskCollection | ProjectorGhostImaging,
     buckets: NDArray,
+    bucket_weights: NDArray | None = None,
     iterations: int = 2000,
     reg: cct.regularizers.BaseRegularizer | None = None,
     verbose: bool = False,
-) -> tuple[NDArray, cct.solvers.SolutionInfo | None, PerfMeterTask]:
+) -> tuple[NDArray, cct.solvers.SolutionInfo, PerfMeterTask]:
     """
     Perform variational reconstruction.
 
     Parameters
     ----------
-    masks : NDArray | MaskCollection
+    masks : NDArray | MaskCollection | ProjectorGhostImaging
         The masks used for reconstruction.
     buckets : NDArray
         The bucket data.
@@ -97,21 +108,22 @@ def reconstruct_variational(
     """
     c0 = perf_counter()
 
-    if not isinstance(masks, MaskCollection):
-        masks = MaskCollection(masks)
-
-    p = cct.struct_illum.ProjectorGhostImaging(masks)
+    prj = _get_projector(masks)
 
     c1 = perf_counter()
 
-    if reg is None:
-        rec = p.fbp(buckets, adjust_scaling=False)
-        info = None
+    if reg is None and bucket_weights is None:
+        rec = prj.fbp(buckets, adjust_scaling=False)
+        info = SolutionInfo("FBP", 0, None)
     else:
-        solver = cct.solvers.PDHG(verbose=verbose, regularizer=reg, leave_progress=False)
-        rec, info = solver(p, buckets, iterations=iterations)
+        if bucket_weights is None:
+            dt = cct.data_terms.DataFidelity_l2()
+        else:
+            dt = cct.data_terms.DataFidelity_wl2(bucket_weights)
+        solver = cct.solvers.PDHG(verbose=verbose, regularizer=reg, data_term=dt, leave_progress=False)
+        rec, info = solver(prj, buckets, iterations=iterations)
 
-    rec = post_process_scale_bias(rec, masks, buckets)
+    rec = post_process_scale_bias(rec, prj, buckets)
 
     c2 = perf_counter()
 
@@ -244,10 +256,10 @@ def reconstruct_neural_cnn(
 
 
 def fit_variational_reg_weight(
-    masks: NDArray | MaskCollection,
+    masks: NDArray | MaskCollection | ProjectorGhostImaging,
     buckets: NDArray,
     reg: Callable[[float], cct.regularizers.BaseRegularizer] = cct.regularizers.Regularizer_TV2D,
-    lambda_range: tuple[float, float] = (1e-3, 1e2),
+    lambda_range: tuple[float, float, int] | NDArray = (1e-3, 1e2, 2),
     iterations: int = 2000,
     lower_limit: float | None = None,
     num_averages: int = 3,
@@ -258,14 +270,14 @@ def fit_variational_reg_weight(
 
     Parameters
     ----------
-    masks : NDArray | MaskCollection
+    masks : NDArray | MaskCollection | ProjectorGhostImaging
         The masks used for reconstruction.
     buckets : NDArray
         The bucket data.
     reg : Callable[[float], cct.regularizers.BaseRegularizer], optional
         Function to create a regularizer given a lambda value, by default cct.regularizers.Regularizer_TV2D.
-    lambda_range : tuple[float, float], optional
-        Range of lambda values to test, by default (1e-3, 1e2).
+    lambda_range : tuple[float, float, int] | NDArray, optional
+        Range of lambda values to test, by default (1e-3, 1e2, 2).
     iterations : int, optional
         Number of iterations for the solver, by default 2000.
     lower_limit : float | None, optional
@@ -282,9 +294,10 @@ def fit_variational_reg_weight(
     """
     solver_verbose = not isinstance(parallel_eval, Executor)
 
+    prj = _get_projector(masks)
+
     def solve_reg(lam: float, b_test_mask: NDArray | None = None) -> tuple[NDArray, SolutionInfo]:
         solver = cct.solvers.PDHG(regularizer=reg(lam), verbose=solver_verbose, leave_progress=False)
-        prj = cct.struct_illum.ProjectorGhostImaging(masks)
         return solver(prj, buckets, iterations=iterations, lower_limit=lower_limit, b_test_mask=b_test_mask)
 
     cv = cct.param_tuning.CrossValidation(
@@ -292,15 +305,19 @@ def fit_variational_reg_weight(
     )
     cv.task_exec_function = solve_reg
 
-    lams = cct.param_tuning.get_lambda_range(*lambda_range, num_per_order=2)
+    if isinstance(lambda_range, np.ndarray):
+        lams = np.array(lambda_range, ndmin=1)
+    else:
+        lams = cct.param_tuning.get_lambda_range(*lambda_range)
+
     f_avgs, _, all_info = cv.compute_loss_values(lams, return_all=True)
     lam_min, _ = cv.fit_loss_min(lams, f_avgs)
-    print(lam_min)
+    print(f"Minimum lambda found at: {lam_min:.3e}")
 
     c0 = perf_counter()
 
     rec_reg, _ = solve_reg(lam_min)
-    rec_reg = post_process_scale_bias(rec_reg, masks, buckets)
+    rec_reg = post_process_scale_bias(rec_reg, prj, buckets)
 
     c1 = perf_counter()
     final_rec_perfs = PerfMeterTask(init_time_s=0.0, exec_time_s=c1 - c0, total_time_s=c1 - c0)
