@@ -363,7 +363,6 @@ class N2G(Denoiser):
         lower_limit: float | NDArray | None = None,
         fit_cv_scale_bias: bool = True,
         clip_grad: bool = True,
-        accum_grads: bool = False,
         loss_track_type: str = "tst",
     ) -> dict[str, NDArray]:
         if epochs < 1:
@@ -423,50 +422,32 @@ class N2G(Denoiser):
 
                 optim.zero_grad()
 
-                if accum_grads:
-                    for ii in range(inp_trn_r_ep_ch.shape[0]):
-                        tmp_trn_i = self.model(inp_trn_r_ep_ch[ii : ii + 1 :])
-                        tmp_trn_b = _gi_fwd(tgt_trn_m_t, tmp_trn_i[0, 0, :, :])
+                # Compute network's output
+                tmp_trn_i = self.model(inp_trn_r_ep_ch)
+                # Compute residual on target
+                tmp_trn_b = _gi_fwd(tgt_trn_m_t, tmp_trn_i[..., 0, :, :])
 
-                        if tgt_trn_inds is not None:
-                            tmp_trn_b = tmp_trn_b[tgt_trn_inds[chunk + ii * num_chunks]]
-                            tgt_tmp_b = tgt_trn_b_t[chunk + ii * num_chunks]
-                        else:
-                            tgt_tmp_b = tgt_trn_b_t
-
-                        loss_trn = loss_data_fn(tmp_trn_b, tgt_tmp_b) / num_tgt_trn_b
-                        if loss_reg_fn is not None:
-                            loss_trn += loss_reg_fn(tmp_trn_i)
-                        if lower_limit is not None:
-                            loss_trn += nn.ReLU(inplace=False)(-tmp_trn_i.flatten() + lower_limit).mean()
-
-                        loss_trn.backward()
-                        loss_trn_val += loss_trn.item()
-                else:
-                    # Compute network's output
-                    tmp_trn_i = self.model(inp_trn_r_ep_ch)
-                    # Compute residual on target
-                    tmp_trn_b = _gi_fwd(tgt_trn_m_t, tmp_trn_i[..., 0, :, :])
-
-                    if tgt_trn_inds is not None:
-                        tmp_trn_b = pt.stack(
-                            [tmp_trn_b[ii][inds] for ii, inds in enumerate(tgt_trn_inds[chunk::num_chunks])], dim=0
-                        )
-                        tgt_tmp_b = tgt_trn_b_t[chunk::num_chunks]
-                    else:
-                        tgt_tmp_b = tgt_trn_b_t
+                if tgt_trn_inds is not None:
+                    # Slice the projected buckets to select the correct targets for each input
+                    tmp_trn_b = pt.stack(
+                        [tmp_trn_b[ii][inds] for ii, inds in enumerate(tgt_trn_inds[chunk::num_chunks])], dim=0
+                    )
+                    tgt_tmp_b = tgt_trn_b_t[chunk::num_chunks]
 
                     if inp_trn_r_t.shape[0] > 1:
+                        # Add an extra constraint on the mean reconstruction, when we are sure to be using n2g mode
                         tmp_trn_i = pt.concatenate((tmp_trn_i, tmp_trn_i.mean(dim=0, keepdim=True)), dim=0)
+                else:
+                    tgt_tmp_b = tgt_trn_b_t
 
-                    loss_trn = loss_data_fn(tmp_trn_b, tgt_tmp_b) / num_tgt_trn_b
-                    if loss_reg_fn is not None:
-                        loss_trn += loss_reg_fn(tmp_trn_i)
-                    if lower_limit is not None:
-                        loss_trn += nn.ReLU(inplace=False)(-tmp_trn_i.flatten() + lower_limit).mean()
+                loss_trn = loss_data_fn(tmp_trn_b, tgt_tmp_b) / num_tgt_trn_b
+                if loss_reg_fn is not None:
+                    loss_trn += loss_reg_fn(tmp_trn_i)
+                if lower_limit is not None:
+                    loss_trn += nn.ReLU(inplace=False)(-tmp_trn_i.flatten() + lower_limit).mean()
 
-                    loss_trn.backward()
-                    loss_trn_val += loss_trn.item()
+                loss_trn.backward()
+                loss_trn_val += loss_trn.item()
 
                 fix_invalid_gradient_values(self.model)
                 if clip_grad:

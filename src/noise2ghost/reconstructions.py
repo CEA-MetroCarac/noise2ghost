@@ -43,7 +43,6 @@ class RecParsCNN:
     optim_algo: str = "adam"
     cv_fraction: float = 0.1
     num_averages: int = 1
-    accum_grads: bool = False
     rng_seed: int | None = None
 
 
@@ -249,7 +248,6 @@ def reconstruct_neural_cnn(
         learning_rate=rec_pars.lr,
         lower_limit=rec_pars.lower_limit,
         algo=rec_pars.optim_algo,
-        accum_grads=rec_pars.accum_grads,
     )
     gi_rec = solver_n2g.infer(inp_recs_trn)
     if is_n2g:
@@ -417,7 +415,6 @@ def fit_neural_cnn_reg_weight(
                 learning_rate=rec_pars.lr,
                 algo=rec_pars.optim_algo,
                 lower_limit=rec_pars.lower_limit,
-                accum_grads=rec_pars.accum_grads,
             )
             gi_rec = solver_n2g.infer(recs_trn_inp)
             if is_n2g:
