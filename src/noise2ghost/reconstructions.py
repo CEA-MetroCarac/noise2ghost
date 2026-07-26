@@ -14,7 +14,7 @@ import corrct as cct
 from corrct.solvers import SolutionInfo
 import matplotlib.pyplot as plt
 import numpy as np
-from autoden.losses import LossRegularizer
+from autoden.losses import LossRegularizer, LossTV
 from autoden.algorithms.noise2noise import N2N
 from autoden.algorithms.noise2void import N2V
 from autoden.models.io import load_model
@@ -405,6 +405,7 @@ def fit_neural_cnn_reg_weight(
     buckets: NDArray,
     rec_pars: RecParsCNN,
     reg_vals: Sequence[float | None] | NDArray | float | None = None,
+    reg_type: Callable[[float], LossRegularizer] = LossTV,
     device: str = "cuda",
 ) -> tuple[float, NDArray, dict[str, NDArray], PerfMeterBatch]:
     """
@@ -462,7 +463,8 @@ def fit_neural_cnn_reg_weight(
         for ii_r, reg_val in enumerate(reg_vals):
             print(f"{ii_r+1}/{len(reg_vals)} Lambda: {reg_val:.3e}")
             ct0 = perf_counter()
-            solver_n2g = N2G(model=deepcopy(model), reg_val=reg_val, data_scale_bias=data_sb, device=device)
+
+            solver_n2g = N2G(model=deepcopy(model), reg_val=reg_type(reg_val), data_scale_bias=data_sb, device=device)
             ct1 = perf_counter()
             losses = solver_n2g.train(
                 recs_trn_inp,
@@ -496,7 +498,9 @@ def fit_neural_cnn_reg_weight(
         reg_vals, f_vals=min_losses_avg, f_stds=min_losses_std, verbose=True, plot_result=True
     )
 
-    gi_rec, losses, rec_perf = reconstruct_neural_cnn(masks, buckets, rec_pars=rec_pars, reg_val=min_reg_weight, device=device)
+    gi_rec, losses, rec_perf = reconstruct_neural_cnn(
+        masks, buckets, rec_pars=rec_pars, reg_val=reg_type(min_reg_weight), device=device
+    )
     stats_tasks.append(rec_perf)
 
     cb2 = perf_counter()
