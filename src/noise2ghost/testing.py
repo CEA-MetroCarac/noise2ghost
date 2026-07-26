@@ -234,9 +234,12 @@ def save_results(
     reg_vals: dict[str, float | NDArray] | None = None,
     perfs: dict | None = None,
     save_old: bool = True,
+    prefix: str | None = None,
     verbose: bool = False,
 ) -> None:
     result_dir = DATASETS_DIR / "results_N2G"
+    if prefix is not None:
+        result_dir = result_dir / prefix
     result_dir.mkdir(parents=True, exist_ok=True)
 
     results_fname = result_dir / _get_dataset_filename(info, extension="npz")
@@ -262,11 +265,21 @@ def save_results(
 
 
 def load_results(
-    info: dict, use_external_gidc: bool = False, use_external_sup: bool = False, verbose: bool = False
+    info: dict,
+    use_external_gidc: bool = False,
+    use_external_sup: bool = False,
+    prefix: str | None = None,
+    snapshot: str | None = None,
+    verbose: bool = False,
 ) -> tuple[dict[str, NDArray], dict[str, float | NDArray], dict]:
     results_fname = _get_dataset_filename(info, extension="npz")
-    results_fpath = DATASETS_DIR / "results_N2G" / results_fname
+    result_dir = DATASETS_DIR / "results_N2G"
+    if prefix is not None:
+        result_dir = result_dir / prefix
+    results_fpath = result_dir / results_fname
     results_fpath.expanduser()
+    if snapshot is not None:
+        results_fpath = results_fpath.with_stem(results_fpath.stem + f"_{snapshot}")
     if verbose:
         print(f"LOADING: {results_fpath}")
 
