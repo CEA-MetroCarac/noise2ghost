@@ -8,9 +8,11 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
+from typing import Literal
 
 import corrct as cct
 from corrct.solvers import SolutionInfo
+import matplotlib.pyplot as plt
 import numpy as np
 from autoden.losses import LossRegularizer
 from autoden.algorithms.noise2noise import N2N
@@ -22,7 +24,14 @@ from corrct.struct_illum import MaskCollection, ProjectorGhostImaging
 from numpy.typing import NDArray
 from torch.nn import Module
 
-from noise2ghost.algos import INR, N2G, post_process_scale_bias, DataScaleBias
+from noise2ghost.algos import (
+    INR,
+    N2G,
+    post_process_scale_bias,
+    DataScaleBias,
+    compute_scaling_ghost_imaging,
+    rescale_bias_inputs,
+)
 from noise2ghost.models.config import NetworkParamsINR
 from noise2ghost.models.inr import SIREN
 
@@ -69,11 +78,14 @@ def _get_model(model: str | Path | Module | NetworkParams) -> Module:
         return deepcopy(model)
 
 
-def _get_projector(masks_or_proj: NDArray | MaskCollection | ProjectorGhostImaging) -> ProjectorGhostImaging:
+def _get_projector(
+    masks_or_proj: NDArray | MaskCollection | ProjectorGhostImaging,
+    projector_cls: Callable[[NDArray | MaskCollection], ProjectorGhostImaging] = ProjectorGhostImaging,
+) -> ProjectorGhostImaging:
     if isinstance(masks_or_proj, ProjectorGhostImaging):
         prj = masks_or_proj
-    elif isinstance(masks_or_proj, (MaskCollection, NDArray)):
-        prj = cct.struct_illum.ProjectorGhostImaging(masks_or_proj)
+    elif isinstance(masks_or_proj, (MaskCollection, np.ndarray)):
+        prj = projector_cls(masks_or_proj)
     else:
         raise ValueError("You should provide one of [NDArray | MaskCollection | ProjectorGhostImaging]")
     return prj
@@ -85,6 +97,8 @@ def reconstruct_variational(
     bucket_weights: NDArray | None = None,
     iterations: int = 2000,
     reg: cct.regularizers.BaseRegularizer | None = None,
+    projector_cls: Callable[[NDArray | MaskCollection], ProjectorGhostImaging] = ProjectorGhostImaging,
+    normalize: bool = False,
     verbose: bool = False,
 ) -> tuple[NDArray, cct.solvers.SolutionInfo, PerfMeterTask]:
     """
@@ -110,7 +124,13 @@ def reconstruct_variational(
     """
     c0 = perf_counter()
 
-    prj = _get_projector(masks)
+    prj = _get_projector(masks, projector_cls=projector_cls)
+
+    data_sb = None
+    if normalize:
+        data_sb = compute_scaling_ghost_imaging(masks=prj.mc.masks_enc, buckets=buckets, projector_cls=projector_cls)
+        masks, buckets = rescale_bias_inputs(data_sb, prj.mc.masks_enc, buckets)
+        prj = _get_projector(masks, projector_cls=projector_cls)
 
     c1 = perf_counter()
 
@@ -121,11 +141,13 @@ def reconstruct_variational(
         if bucket_weights is None:
             dt = cct.data_terms.DataFidelity_l2()
         else:
-            dt = cct.data_terms.DataFidelity_wl2(bucket_weights)
-        solver = cct.solvers.PDHG(verbose=verbose, regularizer=reg, data_term=dt, leave_progress=False)
+            dt = cct.data_terms.DataFidelity_l2w(bucket_weights)
+        solver = cct.solvers.PDHG(verbose=verbose, regularizer=reg, data_term=dt, leave_progress=False, criterion="loss_rec")
         rec, info = solver(prj, buckets, iterations=iterations)
 
     rec = post_process_scale_bias(rec, prj, buckets)
+    if data_sb is not None:
+        rec = (rec + data_sb.bias_out) / data_sb.scale_out
 
     c2 = perf_counter()
 
@@ -263,12 +285,17 @@ def reconstruct_neural_cnn(
 def fit_variational_reg_weight(
     masks: NDArray | MaskCollection | ProjectorGhostImaging,
     buckets: NDArray,
+    bucket_weights: NDArray | None = None,
     reg: Callable[[float], cct.regularizers.BaseRegularizer] = cct.regularizers.Regularizer_TV2D,
     lambda_range: tuple[float, float, int] | NDArray = (1e-3, 1e2, 2),
     iterations: int = 2000,
     lower_limit: float | None = None,
     num_averages: int = 3,
     parallel_eval: bool | int | Executor = False,
+    projector_cls: Callable[[NDArray | MaskCollection], ProjectorGhostImaging] = ProjectorGhostImaging,
+    normalize: bool = False,
+    criterion: Literal["max_iter", "loss_rec", "loss_val"] = "loss_val",
+    plot_final_loss: bool = True,
 ) -> tuple[float, NDArray, PerfMeterBatch]:
     """
     Fit the regularization weight for variational reconstruction.
@@ -299,11 +326,23 @@ def fit_variational_reg_weight(
     """
     solver_verbose = not isinstance(parallel_eval, Executor)
 
-    prj = _get_projector(masks)
+    prj = _get_projector(masks, projector_cls=projector_cls)
 
-    def solve_reg(lam: float, b_test_mask: NDArray | None = None) -> tuple[NDArray, SolutionInfo]:
-        solver = cct.solvers.PDHG(regularizer=reg(lam), verbose=solver_verbose, leave_progress=False)
-        return solver(prj, buckets, iterations=iterations, lower_limit=lower_limit, b_test_mask=b_test_mask)
+    data_sb = None
+    if normalize:
+        data_sb = compute_scaling_ghost_imaging(masks=prj.mc.masks_enc, buckets=buckets, projector_cls=projector_cls)
+        masks, buckets = rescale_bias_inputs(data_sb, prj.mc.masks_enc, buckets)
+        prj = _get_projector(masks, projector_cls=projector_cls)
+
+    def solve_reg(lam: float, b_val_mask: NDArray | None = None) -> tuple[NDArray, SolutionInfo]:
+        if bucket_weights is None:
+            data_term = cct.data_terms.DataFidelity_l2()
+        else:
+            data_term = cct.data_terms.DataFidelity_l2w(bucket_weights)
+        solver = cct.solvers.PDHG(
+            regularizer=reg(lam), verbose=solver_verbose, leave_progress=False, criterion=criterion, data_term=data_term
+        )
+        return solver(prj, buckets, iterations=iterations, lower_limit=lower_limit, b_val_mask=b_val_mask)
 
     cv = cct.param_tuning.CrossValidation(
         buckets.shape, num_averages=num_averages, verbose=True, plot_result=True, parallel_eval=parallel_eval
@@ -321,14 +360,33 @@ def fit_variational_reg_weight(
 
     c0 = perf_counter()
 
-    rec_reg, _ = solve_reg(lam_min)
+    b_cv_mask = None
+    if criterion.lower() == "loss_val":
+        b_cv_mask = cct.param_tuning.create_random_test_mask(buckets.shape)
+    rec_reg, info = solve_reg(lam_min, b_cv_mask)
     rec_reg = post_process_scale_bias(rec_reg, prj, buckets)
+    if data_sb is not None:
+        rec_reg = (rec_reg + data_sb.bias_out) / data_sb.scale_out
 
     c1 = perf_counter()
     final_rec_perfs = PerfMeterTask(init_time_s=0.0, exec_time_s=c1 - c0, total_time_s=c1 - c0)
 
     stats = sum([info[2] for info in all_info], PerfMeterBatch())
     stats.append(final_rec_perfs)
+
+    if plot_final_loss:
+        fig, axs = plt.subplots(1, 1)
+        axs.plot(info.residuals_rec_rel, label="Residual - REC")
+        axs.stem(info.best_residual_ind_rec - 1, info.get_best_residual_rec(), label="Best - REC")
+        if criterion.lower() == "loss_val":
+            axs.plot(info.residuals_val_rel, label="Residual - VAL")
+            axs.stem(info.best_residual_ind_val - 1, info.get_best_residual_val(), label="Best - VAL")
+        axs.grid()
+        axs.legend()
+        axs.set_ylabel("Loss")
+        axs.set_xlabel("Iterations")
+        axs.set_yscale("log")
+        fig.tight_layout()
 
     return lam_min, rec_reg, stats
 

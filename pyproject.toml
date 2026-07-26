@@ -37,7 +37,7 @@ dependencies = [
     "matplotlib",
     "scikit-image",
     "h5py",
-    "corrct>=1.0.0",
+    "corrct>=3.0.0",
     "torch",
     "auto-denoise"
 ]

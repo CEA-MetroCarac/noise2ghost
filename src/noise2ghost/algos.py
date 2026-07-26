@@ -287,6 +287,10 @@ def compute_scaling_ghost_imaging(
     return data_sb
 
 
+def rescale_bias_inputs(data_sb: DataScaleBias, inp_masks: NDArray, inp_buckets: NDArray) -> tuple[NDArray, NDArray]:
+    return inp_masks * data_sb.scale_tgt / data_sb.scale_out, (inp_buckets - data_sb.bias_tgt) * data_sb.scale_tgt
+
+
 class N2G(Denoiser):
     """Perform self-supervised reconstruction of GI."""
 
@@ -306,10 +310,10 @@ class N2G(Denoiser):
         if self.data_sb is None or force_scaling:
             self.data_sb = compute_scaling_ghost_imaging(inp_masks, inp_buckets, adjust_scaling=adjust_scaling)
 
-        inp_buckets = inp_buckets - self.data_sb.bias_tgt
-
-        inp_buckets = inp_buckets * self.data_sb.scale_tgt
-        inp_masks = inp_masks * self.data_sb.scale_tgt / self.data_sb.scale_out
+        # inp_buckets = inp_buckets - self.data_sb.bias_tgt
+        # inp_buckets = inp_buckets * self.data_sb.scale_tgt
+        # inp_masks = inp_masks * self.data_sb.scale_tgt / self.data_sb.scale_out
+        inp_masks, inp_buckets = rescale_bias_inputs(self.data_sb, inp_masks, inp_buckets)
 
         if self.verbose and not (self.data_sb is None or force_scaling):
             mc = MaskCollection(inp_masks)
