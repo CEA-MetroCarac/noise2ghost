@@ -14,6 +14,7 @@ from autoden.models.param_utils import fix_invalid_gradient_values, get_num_para
 from corrct.struct_illum import MaskCollection, ProjectorGhostImaging
 from corrct.processing.post import fit_scale_bias
 from numpy.typing import NDArray
+from scipy.optimize import minimize
 from tqdm.auto import trange
 
 from noise2ghost.models.config import NetworkParamsINR
@@ -143,6 +144,48 @@ def _gi_fwd(masks: pt.Tensor, image: pt.Tensor, n_dims: int = 2) -> pt.Tensor:
 
     out = masks.matmul(image)
     return out.squeeze(dim=-1)
+
+
+def fit_scale_bias_torch(
+    img_data: pt.Tensor, prj_data: pt.Tensor, prj: Callable[[pt.Tensor], pt.Tensor] | None = None
+) -> tuple[float, float]:
+    """Fit the scale and bias of an image, against its projection in a different space.
+
+    Parameters
+    ----------
+    img_data : Tensor
+        The image data
+    prj_data : Tensor
+        The projected data
+    prj : BaseTransform | None, optional
+        The projection operator. The default is None, which uses the identity (TransformIdentity)
+
+    Returns
+    -------
+    tuple[float, float]
+        The scale and bias
+    """
+    if prj is None:
+        prj = lambda x: x
+
+    prj_x = prj(img_data)
+    prj_1 = prj(pt.ones_like(img_data))
+    m_y_dot_prj_x = -float(pt.sum(prj_data * prj_x).item())
+    m_y_dot_prj_1 = -float(pt.sum(prj_data * prj_1).item())
+    prj_x_2 = float(pt.sum(prj_x**2).item())
+    prj_1_2 = float(pt.sum(prj_1**2).item())
+    prj_1_dot_prj_x = float(pt.sum(prj_1 * prj_x).item())
+
+    def obj_func(ab: NDArray) -> tuple[float, NDArray]:
+        a = float(ab[0])
+        b = float(ab[1])
+        residual = prj(img_data * a + b) - prj_data
+        grad_a = m_y_dot_prj_x + prj_x_2 * a + prj_1_dot_prj_x * b
+        grad_b = m_y_dot_prj_1 + prj_1_2 * b + prj_1_dot_prj_x * a
+        return float(pt.linalg.vector_norm(residual, ord=2).item() ** 2) / 2, np.array((grad_a, grad_b))
+
+    opt_res = minimize(obj_func, [1.0, 0.0], jac=True)
+    return float(opt_res.x[0]), float(opt_res.x[1])
 
 
 def compute_scaling_ghost_imaging(
@@ -318,6 +361,7 @@ class N2G(Denoiser):
         learning_rate: float = 1e-4,
         weight_decay: float = 1e-2,
         lower_limit: float | NDArray | None = None,
+        fit_cv_scale_bias: bool = True,
         accum_grads: bool = False,
         loss_track_type: str = "tst",
     ) -> dict[str, NDArray]:
@@ -351,7 +395,11 @@ class N2G(Denoiser):
         tgt_tst_b_t = pt.tensor(tgt_tst_mb[1].astype(np.float32), device=self.device)
         tgt_tst_b_t_sbi = (tgt_tst_b_t - tgt_tst_b_t.mean()) / (tgt_tst_b_t.std() + 1e-5)
 
+        tgt_all_m_t = pt.tensor(np.concatenate((tgt_trn_mb[0], tgt_tst_mb[0])).astype(np.float32), device=self.device)
+        tgt_all_b_t = pt.tensor(np.concatenate((tgt_trn_mb[1], tgt_tst_mb[1])).astype(np.float32), device=self.device)
+
         num_inp_recs = inp_trn_r_t.shape[0]
+        # num_chunks = num_inputs / batch_size, where batch_size is increasing throughout the epochs
         all_num_chunks = _compute_num_chunks(epochs, num_inps=num_inp_recs)
         previous_chunks = all_num_chunks[0] * 2
 
@@ -432,9 +480,20 @@ class N2G(Denoiser):
                 # Compute network's output
                 tmp_tst_i = self.model(inp_trn_r_t)
 
-                # Compute residual on target
-                tmp_tst_b = _gi_fwd(tgt_tst_m_t, tmp_tst_i.mean(dim=(0, 1)))
+                # Reduce image only if in single-image N2G - It will still assume single-channel
+                reduce_dims = tuple(np.arange(tgt_trn_inds is None, 2))
+                tmp_tst_i = tmp_tst_i.mean(dim=reduce_dims)
 
+                if fit_cv_scale_bias:
+                    # We adjust scale and bias of the output to match the scale and bias of all buckets
+                    def _gi_fwd_all_b_t(x: pt.Tensor) -> pt.Tensor:
+                        return _gi_fwd(tgt_all_m_t, x)
+
+                    scale, bias = fit_scale_bias_torch(tmp_tst_i, tgt_all_b_t, _gi_fwd_all_b_t)
+                    tmp_tst_i = tmp_tst_i * scale + bias
+
+                # Compute residual on target
+                tmp_tst_b = _gi_fwd(tgt_tst_m_t, tmp_tst_i)
                 loss_tst = loss_data_fn(tmp_tst_b, tgt_tst_b_t) / num_tgt_tst_b
                 losses["tst"].append(loss_tst.item())
 
