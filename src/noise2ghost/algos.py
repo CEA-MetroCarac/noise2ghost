@@ -362,6 +362,7 @@ class N2G(Denoiser):
         weight_decay: float = 1e-2,
         lower_limit: float | NDArray | None = None,
         fit_cv_scale_bias: bool = True,
+        clip_grad: bool = True,
         accum_grads: bool = False,
         loss_track_type: str = "tst",
     ) -> dict[str, NDArray]:
@@ -468,7 +469,8 @@ class N2G(Denoiser):
                     loss_trn_val += loss_trn.item()
 
                 fix_invalid_gradient_values(self.model)
-                # nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
+                if clip_grad:
+                    nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=(2 * num_chunks) ** 0.5)
 
                 optim.step()
 
