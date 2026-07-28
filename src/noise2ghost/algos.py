@@ -368,6 +368,7 @@ class N2G(Denoiser):
         fit_cv_scale_bias: bool = True,
         clip_grad: bool = True,
         loss_track_type: str = "tst",
+        plot_checkpoint_fig: bool = False,
     ) -> dict[str, NDArray]:
         if epochs < 1:
             raise ValueError(f"Number of epochs should be >= 1, but {epochs} was passed")
@@ -510,21 +511,22 @@ class N2G(Denoiser):
                     f" (best: {best_loss:.5}, ep: {best_epoch})"
                 )  # , l1 = {latent_l1_norm:.5}
 
-                fig, axs = plt.subplots(1, 4, figsize=[12, 3.25])
-                fig.suptitle(f"Iteration: {epoch}, n.inp: {inp_trn_r_t.shape[0]}")
-                axs[0].imshow(inp_trn_r_t[0, 0].detach().cpu().numpy())
-                axs[0].set_title("input_0")
-                axs[1].imshow(tmp_trn_i[0, 0].detach().cpu().numpy())
-                axs[1].set_title("net(input_0)")
-                axs[2].imshow(tmp_trn_i.mean(dim=(0, 1)).detach().cpu().numpy())
-                axs[2].set_title("net(input).mean()")
-                axs[3].plot(tmp_trn_b.mean(dim=0).detach().cpu().numpy(), label="fwd")
-                axs[3].plot(tgt_trn_mb[1], label="tgt")
-                axs[3].plot(tmp_trn_b.mean(dim=0).detach().cpu().numpy() - tgt_trn_mb[1], label="diff")
-                axs[3].grid()
-                axs[3].legend()
-                axs[3].set_title("buckets")
-                fig.tight_layout()
+                if plot_checkpoint_fig:
+                    fig, axs = plt.subplots(1, 4, figsize=[12, 3.25])
+                    fig.suptitle(f"Iteration: {epoch}, n.inp: {inp_trn_r_t.shape[0]}")
+                    axs[0].imshow(inp_trn_r_t[0, 0].detach().cpu().numpy())
+                    axs[0].set_title("input_0")
+                    axs[1].imshow(tmp_trn_i[0, 0].detach().cpu().numpy())
+                    axs[1].set_title("net(input_0)")
+                    axs[2].imshow(tmp_trn_i.mean(dim=(0, 1)).detach().cpu().numpy())
+                    axs[2].set_title("net(input).mean()")
+                    axs[3].plot(tmp_trn_b.mean(dim=0).detach().cpu().numpy(), label="fwd")
+                    axs[3].plot(tgt_trn_mb[1], label="tgt")
+                    axs[3].plot(tmp_trn_b.mean(dim=0).detach().cpu().numpy() - tgt_trn_mb[1], label="diff")
+                    axs[3].grid()
+                    axs[3].legend()
+                    axs[3].set_title("buckets")
+                    fig.tight_layout()
 
         self.model.load_state_dict(best_state)
 
