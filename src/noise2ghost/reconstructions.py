@@ -296,7 +296,7 @@ def fit_variational_reg_weight(
     normalize: bool = False,
     criterion: Literal["max_iter", "loss_rec", "loss_val"] = "loss_val",
     plot_final_loss: bool = True,
-) -> tuple[float, NDArray, PerfMeterBatch]:
+) -> tuple[float, NDArray, SolutionInfo, PerfMeterBatch]:
     """
     Fit the regularization weight for variational reconstruction.
 
@@ -306,6 +306,8 @@ def fit_variational_reg_weight(
         The masks used for reconstruction.
     buckets : NDArray
         The bucket data.
+    bucket_weights : NDArray | None, optional
+        Weights for the bucket data, by default None.
     reg : Callable[[float], cct.regularizers.BaseRegularizer], optional
         Function to create a regularizer given a lambda value, by default cct.regularizers.Regularizer_TV2D.
     lambda_range : tuple[float, float, int] | NDArray, optional
@@ -318,10 +320,18 @@ def fit_variational_reg_weight(
         Number of averages for cross-validation, by default 3.
     parallel_eval : bool | int | Executor, optional
         Whether to use parallel evaluation, by default False.
+    projector_cls : Callable[[NDArray | MaskCollection], ProjectorGhostImaging], optional
+        Function to create a projector given masks, by default ProjectorGhostImaging.
+    normalize : bool, optional
+        Whether to normalize the input data, by default False.
+    criterion : Literal["max_iter", "loss_rec", "loss_val"], optional
+        Criterion for stopping the solver, by default "loss_val".
+    plot_final_loss : bool, optional
+        Whether to plot the final loss, by default True.
 
     Returns
     -------
-    tuple[float, NDArray]
+    tuple[float, NDArray, SolutionInfo, PerfMeterBatch]
         The best lambda value and the reconstructed image.
     """
     solver_verbose = not isinstance(parallel_eval, Executor)
@@ -388,7 +398,7 @@ def fit_variational_reg_weight(
         axs.set_yscale("log")
         fig.tight_layout()
 
-    return lam_min, rec_reg, stats
+    return lam_min, rec_reg, info, stats
 
 
 @dataclass
