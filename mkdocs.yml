@@ -17,6 +17,8 @@ nav:
 - Home:
   - Overview: index.md
   - Changelog: changelog.md
+  - Tutorials:
+    - Synthetic data: tutorials/01_synthetic_data_10x_gauss.md
   - License: license.md
 # defer to gen-files + literate-nav
 - API reference:
@@ -71,6 +73,8 @@ markdown_extensions:
 - attr_list
 - admonition
 - footnotes
+- pymdownx.arithmatex:
+    generic: true
 - pymdownx.emoji:
     emoji_index: !!python/name:material.extensions.emoji.twemoji
     emoji_generator: !!python/name:material.extensions.emoji.to_svg
@@ -127,6 +131,10 @@ plugins:
     enabled: !ENV [MATERIAL_INSIDERS, false]
     plugins:
     - typeset
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
 
 extra:
   social:
