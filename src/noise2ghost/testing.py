@@ -31,13 +31,17 @@ except ImportError:
 from noise2ghost.io import DataGI
 from noise2ghost.reconstructions import reconstruct_variational
 
-DATASETS_DIR = Path("data/datasets/").expanduser()
+DEFAULT_DATASETS_DIR = Path("data/datasets/").expanduser()
 
 
 def _create_phantom(
-    shape_fov: Sequence[int] | None = None, phantom_type: str = "chromosomes", dtype: DTypeLike = np.float32
+    shape_fov: Sequence[int] | None = None,
+    phantom_type: str = "chromosomes",
+    root_dir: str | Path = ".",
+    dtype: DTypeLike = np.float32,
 ) -> tuple[NDArray, NDArray, NDArray]:
     print(f"Creating a new dataset for {phantom_type = }")
+    data_dir = Path(root_dir).absolute() / "data"
     match phantom_type.lower().split(":"):
         case ["dots"]:
             shape_fov_tmp = [101, 101]
@@ -45,24 +49,24 @@ def _create_phantom(
             phantom += cct.processing.circular_mask(shape_fov_tmp, radius_offset=-40, vol_origin_zxy=[+10, 20])
             phantom += cct.processing.circular_mask(shape_fov_tmp, radius_offset=-30, vol_origin_zxy=[-20, -10])
         case ["chromosomes"]:
-            phantom = skio.imread("data/chromosomes.png")[:, :, :3]
+            phantom = skio.imread(data_dir / "chromosomes.png")[:, :, :3]
             phantom = skc.rgb2gray(phantom)
             one = np.ones(phantom.shape)
             phantom = one - phantom
         case ["ghost"]:
-            phantom = skio.imread("data/ghost.png")[:, :, :3]
+            phantom = skio.imread(data_dir / "ghost.png")[:, :, :3]
             phantom = skc.rgb2gray(phantom)
             one = np.ones(phantom.shape)
             phantom = one - phantom
         case ["toy_xray"]:
-            phantom = skio.imread("data/toy_xray.tif")
+            phantom = skio.imread(data_dir / "toy_xray.tif")
         case ["shepp-logan"]:
             phantom = skd.shepp_logan_phantom()
         case "stl-10", img_index:
             if not __has_torchvision__:
                 raise ValueError("You'll need `torchvision` to use the STL10 dataset.")
 
-            dset = STL10(root="./data/stl10", download=False)
+            dset = STL10(root=data_dir / "stl10", download=False)
             phantom = np.squeeze(dset[int(img_index)][0])
             phantom = skc.rgb2gray(phantom)
         case _:
@@ -137,9 +141,10 @@ def create_datasets(
     compute_ls: bool = True,
     save: bool = False,
     overwrite: bool = False,
+    root_dir: str | Path = ".",
 ) -> tuple[dict, dict, dict, dict]:
     print("Creating phantom")
-    phantom, foreground, background = _create_phantom(shape_fov, phantom_type=phantom_type)
+    phantom, foreground, background = _create_phantom(shape_fov, phantom_type=phantom_type, root_dir=root_dir)
     if shape_fov is None:
         shape_fov = phantom.shape
     info: dict = dict(
@@ -151,8 +156,9 @@ def create_datasets(
         multiplicity=multiplicity,
     )
 
-    DATASETS_DIR.mkdir(parents=True, exist_ok=True)
-    dset_fname = DATASETS_DIR / _get_dataset_filename(info)
+    dataset_dir = Path(root_dir).absolute() / DEFAULT_DATASETS_DIR
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    dset_fname = dataset_dir / _get_dataset_filename(info)
     dset_fname = dset_fname.expanduser()
 
     if overwrite or not dset_fname.exists():
@@ -236,8 +242,9 @@ def save_results(
     save_old: bool = True,
     prefix: str | None = None,
     verbose: bool = False,
+    root_dir: str | Path = ".",
 ) -> None:
-    result_dir = DATASETS_DIR / "results_N2G"
+    result_dir = Path(root_dir).absolute() / DEFAULT_DATASETS_DIR / "results_N2G"
     if prefix is not None:
         result_dir = result_dir / prefix
     result_dir.mkdir(parents=True, exist_ok=True)
@@ -271,9 +278,11 @@ def load_results(
     prefix: str | None = None,
     snapshot: str | None = None,
     verbose: bool = False,
+    root_dir: str | Path = ".",
 ) -> tuple[dict[str, NDArray], dict[str, float | NDArray], dict]:
     results_fname = _get_dataset_filename(info, extension="npz")
-    result_dir = DATASETS_DIR / "results_N2G"
+    base_dir = Path(root_dir).absolute() / DEFAULT_DATASETS_DIR
+    result_dir = base_dir / "results_N2G"
     if prefix is not None:
         result_dir = result_dir / prefix
     results_fpath = result_dir / results_fname
@@ -289,12 +298,12 @@ def load_results(
     res_perfs = {key: results[f"perfs_{key}"] for key in res_recs.keys() if f"perfs_{key}" in results}
 
     if use_external_gidc:
-        results_fpath = DATASETS_DIR / "results_GIDC" / results_fname
+        results_fpath = base_dir / "results_GIDC" / results_fname
         results_fpath.expanduser()
         res_recs["gi_gidc"] = np.load(results_fpath)["rec"]
 
     if use_external_sup:
-        results_fpath = DATASETS_DIR / "results_sup" / results_fname
+        results_fpath = base_dir / "results_sup" / results_fname
         results_fpath.expanduser()
         res_recs["gi_sup"] = np.load(results_fpath)["rec"]
 
